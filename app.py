@@ -10,6 +10,8 @@ from pymongo import MongoClient, UpdateOne
 from pymongo.errors import BulkWriteError, ServerSelectionTimeoutError, InvalidURI
 import warnings
 warnings.filterwarnings("ignore")
+import certifi
+from urllib.parse import quote_plus, urlparse, urlunparse
 
 # ─── PAGE CONFIG ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -58,25 +60,28 @@ def get_db():
     try:
         client = MongoClient(
             uri,
-            serverSelectionTimeoutMS=8000,
-            connectTimeoutMS=8000,
-            socketTimeoutMS=20000,
+            serverSelectionTimeoutMS=10000,
+            connectTimeoutMS=10000,
+            socketTimeoutMS=30000,
             tls=True,
+            tlsCAFile=certifi.where(),  # <-- Fixes the SSL handshake
             retryWrites=True,
             w="majority",
         )
         client.admin.command("ping")
         db = client["staffing_db"]
 
-        # Performance indexes
+        # Indexes
         db["employees"].create_index("ECN", unique=True)
         db["history"].create_index([("ECN", 1), ("field", 1), ("start_date", 1)])
         db["history"].create_index([("ECN", 1), ("field", 1), ("end_date", 1)])
         db["upload_log"].create_index("upload_date")
         return client, db
+
     except Exception as e:
         st.session_state["_mongo_err"] = str(e)
         return None, None
+
 
 def get_employees_col():
     _, db = get_db()
