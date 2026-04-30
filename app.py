@@ -132,10 +132,9 @@ def df_to_excel_bytes(df: pd.DataFrame, sheet_name="Staffing") -> bytes:
     return buf.getvalue()
 
 # ─── CORE LOGIC ──────────────────────────────────────────────────────────────
-BATCH_SIZE = 500
+BATCH_SIZE = 5000
 
 def flush_batches(col, hist, emp_ops, hist_ops):
-    """Write pending ops to DB in batches."""
     if emp_ops:
         try:
             col.bulk_write(emp_ops, ordered=False)
@@ -154,12 +153,28 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
     if col is None or hist is None:
         return 0, 0, "Database not connected"
 
+    total_rows = len(df)
+
+    # ── PRELOAD: all existing employees into dict (ECN -> doc) ──
+    existing_docs = {}
+    for doc in col.find({}, {"_id": 0}):
+        ecn = doc.get("ECN")
+        if ecn:
+            existing_docs[ecn] = doc
+
+    # ── PRELOAD: latest manual edit date per (ECN, field) ──
+    manual_edits = {}
+    for h in hist.find({"source": "manual_edit"}, {"_id": 0, "ECN": 1, "field": 1, "start_date": 1}):
+        key = (h["ECN"], h["field"])
+        # keep the most recent manual edit date
+        if key not in manual_edits or h["start_date"] > manual_edits[key]:
+            manual_edits[key] = h["start_date"]
+
     emp_ops = []
     hist_ops = []
     inserted = 0
     updated = 0
     skipped_manual = 0
-    total_rows = len(df)
 
     for idx, (_, row) in enumerate(df.iterrows()):
         ecn = str(row.get("ECN", "")).strip()
@@ -168,10 +183,10 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
 
         doc = row_to_doc(row.to_dict())
         doc["ECN"] = ecn
-
-        existing = col.find_one({"ECN": ecn}, {"_id": 0})
+        existing = existing_docs.get(ecn)
 
         if existing is None:
+            # ── NEW EMPLOYEE ──
             doc["_created_at"] = upload_date
             doc["_updated_at"] = upload_date
             doc["_last_upload"] = upload_date
@@ -196,21 +211,19 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
                     upsert=True
                 ))
         else:
+            # ── EXISTING EMPLOYEE ──
             changed = False
+            last_upload = existing.get("_last_upload", "2000-01-01")
+
             for field, new_val in doc.items():
                 if field.startswith("_"):
                     continue
                 old_val = existing.get(field, "")
 
                 if new_val != old_val:
-                    last_manual = hist.find_one({
-                        "ECN": ecn,
-                        "field": field,
-                        "source": "manual_edit",
-                        "start_date": {"$gt": existing.get("_last_upload", "2000-01-01")}
-                    }, sort=[("start_date", -1)])
-
-                    if last_manual:
+                    # Check against preloaded manual edits
+                    manual_date = manual_edits.get((ecn, field))
+                    if manual_date and manual_date > last_upload:
                         skipped_manual += 1
                         continue
 
@@ -244,18 +257,19 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
             else:
                 emp_ops.append(UpdateOne({"ECN": ecn}, {"$set": {"_last_upload": upload_date}}))
 
-        # Flush every BATCH_SIZE to keep memory low and show progress
+        # Flush every BATCH_SIZE
         if len(emp_ops) >= BATCH_SIZE or len(hist_ops) >= BATCH_SIZE:
             flush_batches(col, hist, emp_ops, hist_ops)
             emp_ops = []
             hist_ops = []
             if progress_bar is not None:
-                progress_bar.progress(min(0.99, (idx + 1) / total_rows), text=f"Processed {idx + 1}/{total_rows}...")
+                progress_bar.progress(min(0.99, (idx + 1) / total_rows),
+                                      text=f"Processed {idx + 1:,}/{total_rows:,}...")
 
     # Final flush
     flush_batches(col, hist, emp_ops, hist_ops)
     if progress_bar is not None:
-        progress_bar.progress(1.0, text="Finalizing...")
+        progress_bar.progress(1.0, text="Done!")
 
     if log is not None:
         log.insert_one({
@@ -728,7 +742,7 @@ elif page == "📊 Export Data":
                     "⬇️ Download Daily Export",
                     data=buf.getvalue(),
                     file_name=f"staffing_{label}_daily.xlsx",
-                    mime="application/vnd.openxmlformats.officedocument.spreadsheetml.sheet",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
 
