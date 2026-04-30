@@ -8,7 +8,7 @@ import calendar
 import certifi
 from urllib.parse import quote_plus, urlparse, urlunparse
 from pymongo import MongoClient, UpdateOne
-from pymongo.errors import BulkWriteError
+from pymongo.errors import BulkWriteError, DuplicateKeyError
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -101,6 +101,28 @@ def safe_str(v):
         return v.strftime("%Y-%m-%d")
     return str(v).strip()
 
+def parse_date(v):
+    """Parse various date formats to YYYY-MM-DD string."""
+    if not v or str(v).strip() == "":
+        return None
+    try:
+        if isinstance(v, (datetime, pd.Timestamp)):
+            return v.strftime("%Y-%m-%d")
+        # Try common formats
+        for fmt in ["%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%m-%d-%Y", "%d-%m-%Y", "%Y/%m/%d"]:
+            try:
+                return datetime.strptime(str(v).strip(), fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+        # Excel serial date
+        try:
+            return pd.to_datetime(float(v), unit='D', origin='1899-12-30').strftime("%Y-%m-%d")
+        except (ValueError, OverflowError):
+            pass
+    except Exception:
+        pass
+    return None
+
 def row_to_doc(row: dict) -> dict:
     return {k.replace(".", "_"): safe_str(v) for k, v in row.items()}
 
@@ -111,6 +133,11 @@ def load_excel(uploaded_file) -> pd.DataFrame:
         df = pd.read_excel(uploaded_file, sheet_name=sheet, dtype=str)
         df.columns = [str(c).strip() for c in df.columns]
         df = df.fillna("")
+        if "ECN" in df.columns:
+            before = len(df)
+            df = df.drop_duplicates(subset=["ECN"], keep="last")
+            if len(df) < before:
+                st.toast(f"⚠️ Removed {before - len(df)} duplicate ECN rows", icon="⚠️")
         return df
     except Exception as e:
         st.error(f"Error reading Excel: {e}")
@@ -130,6 +157,13 @@ def df_to_excel_bytes(df: pd.DataFrame, sheet_name="Staffing") -> bytes:
             ws.write(0, col_num, col_name, header_fmt)
             ws.set_column(col_num, col_num, max(15, len(str(col_name)) + 2))
     return buf.getvalue()
+
+def get_doj_start(row: dict, upload_date: str) -> str:
+    """Get the start date for history: DOJ Knack if available and earlier, else upload date."""
+    doj = parse_date(row.get("DOJ Knack", ""))
+    if doj and doj <= upload_date:
+        return doj
+    return upload_date
 
 # ─── CORE LOGIC ──────────────────────────────────────────────────────────────
 BATCH_SIZE = 5000
@@ -166,7 +200,6 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
     manual_edits = {}
     for h in hist.find({"source": "manual_edit"}, {"_id": 0, "ECN": 1, "field": 1, "start_date": 1}):
         key = (h["ECN"], h["field"])
-        # keep the most recent manual edit date
         if key not in manual_edits or h["start_date"] > manual_edits[key]:
             manual_edits[key] = h["start_date"]
 
@@ -185,6 +218,9 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
         doc["ECN"] = ecn
         existing = existing_docs.get(ecn)
 
+        # Determine baseline start date for this employee
+        baseline_start = get_doj_start(row.to_dict(), upload_date)
+
         if existing is None:
             # ── NEW EMPLOYEE ──
             doc["_created_at"] = upload_date
@@ -193,18 +229,19 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
             emp_ops.append(UpdateOne({"ECN": ecn}, {"$set": doc}, upsert=True))
             inserted += 1
 
+            # Only seed history for fields that have values (saves space)
             for field, val in doc.items():
                 if field.startswith("_") or val == "":
                     continue
                 hist_ops.append(UpdateOne(
-                    {"ECN": ecn, "field": field, "start_date": "2000-01-01"},
+                    {"ECN": ecn, "field": field, "start_date": baseline_start},
                     {"$set": {
                         "ECN": ecn,
                         "Employee": doc.get("Employee", ""),
                         "field": field,
                         "value": val,
                         "prev_value": "",
-                        "start_date": "2000-01-01",
+                        "start_date": baseline_start,
                         "end_date": "9999-12-31",
                         "source": "excel_upload",
                     }},
@@ -295,6 +332,19 @@ def get_employees_at_date(query_date: str) -> pd.DataFrame:
 
     df = pd.DataFrame(docs)
 
+    # Filter out employees not yet hired on query_date
+    if "DOJ Knack" in df.columns:
+        df["__doj_parsed"] = df["DOJ Knack"].apply(parse_date)
+        df = df[df["__doj_parsed"].isna() | (df["__doj_parsed"] <= query_date)]
+        df = df.drop(columns=["__doj_parsed"])
+
+    # Filter out employees who already separated before query_date
+    if "Date of Separation" in df.columns:
+        df["__sep_parsed"] = df["Date of Separation"].apply(parse_date)
+        df = df[df["__sep_parsed"].isna() | (df["__sep_parsed"] >= query_date)]
+        df = df.drop(columns=["__sep_parsed"])
+
+    # Apply history overrides active on query_date
     hist_docs = list(hist.find(
         {"start_date": {"$lte": query_date}, "end_date": {"$gt": query_date}},
         {"_id": 0, "ECN": 1, "field": 1, "value": 1}
@@ -320,39 +370,48 @@ def record_manual_edit(ecn: str, field: str, new_value: str, start_date: str):
     col = get_employees_col()
     hist = get_history_col()
     if col is None or hist is None:
-        return False
+        return False, "Database not connected"
 
-    existing = col.find_one({"ECN": ecn})
-    if not existing:
-        return False
+    try:
+        existing = col.find_one({"ECN": ecn})
+        if not existing:
+            return False, "Employee not found"
 
-    old_value = existing.get(field, "")
+        old_value = existing.get(field, "")
 
-    hist.update_many(
-        {"ECN": ecn, "field": field, "end_date": "9999-12-31", "start_date": {"$lte": start_date}},
-        {"$set": {"end_date": start_date}}
-    )
+        # Close any open history entry that overlaps
+        hist.update_many(
+            {"ECN": ecn, "field": field, "end_date": "9999-12-31", "start_date": {"$lte": start_date}},
+            {"$set": {"end_date": start_date}}
+        )
 
-    hist.update_one(
-        {"ECN": ecn, "field": field, "start_date": start_date},
-        {"$set": {
-            "ECN": ecn,
-            "Employee": existing.get("Employee", ""),
-            "field": field,
-            "value": new_value,
-            "prev_value": old_value,
-            "start_date": start_date,
-            "end_date": "9999-12-31",
-            "source": "manual_edit",
-        }},
-        upsert=True
-    )
+        # Insert new history record
+        hist.update_one(
+            {"ECN": ecn, "field": field, "start_date": start_date},
+            {"$set": {
+                "ECN": ecn,
+                "Employee": existing.get("Employee", ""),
+                "field": field,
+                "value": new_value,
+                "prev_value": old_value,
+                "start_date": start_date,
+                "end_date": "9999-12-31",
+                "source": "manual_edit",
+            }},
+            upsert=True
+        )
 
-    col.update_one(
-        {"ECN": ecn},
-        {"$set": {field: new_value, "_updated_at": start_date}}
-    )
-    return True
+        # Update current record
+        col.update_one(
+            {"ECN": ecn},
+            {"$set": {field: new_value, "_updated_at": start_date}}
+        )
+        return True, "Saved"
+
+    except DuplicateKeyError as e:
+        return False, f"Duplicate key error: {str(e)[:100]}"
+    except Exception as e:
+        return False, f"Error: {str(e)[:100]}"
 
 
 def get_employee_history(ecn: str) -> pd.DataFrame:
@@ -412,10 +471,12 @@ if page == "📤 Upload / Sync":
     with col2:
         st.markdown("**Instructions**")
         st.markdown("""
-        - **First upload**: populates the DB (baseline history = 2000-01-01)
-        - **Subsequent uploads**: updates only changed records
-        - **In-app edits are protected**: uploads will NOT overwrite fields manually edited after the last upload
-        - **New columns** are added automatically; missing columns are left unchanged
+        - **Required column:** `ECN` (unique employee ID)
+        - **Any other columns are accepted** — the app adapts automatically
+        - **First upload:** populates the DB (baseline history = DOJ Knack date or upload date)
+        - **Subsequent uploads:** updates only changed records
+        - **In-app edits are protected:** uploads will NOT overwrite fields manually edited after the last upload
+        - **Duplicate ECN rows?** The app keeps the *last* occurrence automatically
         """)
 
     if uploaded:
@@ -427,6 +488,7 @@ if page == "📤 Upload / Sync":
             st.stop()
 
         st.success(f"✅ File loaded — **{len(df):,} rows**, **{len(df.columns)} columns**")
+        st.caption(f"Columns detected: {', '.join(df.columns[:10])}{'...' if len(df.columns) > 10 else ''}")
 
         with st.expander("Preview (first 10 rows)"):
             st.dataframe(df.head(10), use_container_width=True)
@@ -479,6 +541,14 @@ elif page == "👤 Employee Editor":
         st.error("Connect MongoDB first.")
         st.stop()
 
+    st.info("""
+    **How manual edits work:**
+    - Click any row in the table below to open the edit dialog
+    - Change any field and set an **Effective Date**
+    - The change is recorded in history starting from that date
+    - **Future Excel uploads will skip this field** if they occur after your manual edit date
+    """)
+
     search = st.text_input("🔍 Search by name, ECN, or email", placeholder="e.g. Santos, 12345")
     filter_status = st.selectbox("Filter by Status", ["All", "Active", "Inactive", "LOA", "Maternity", "Suspended"])
 
@@ -503,6 +573,9 @@ elif page == "👤 Employee Editor":
     display_cols = [c for c in display_cols if c in df_list.columns]
 
     st.markdown(f"**{len(docs)} employees found** (max 200 shown)")
+    st.caption("👆 Click any row to edit that employee")
+
+    # Use st.dataframe with on_select for row clicking
     selected_rows = st.dataframe(
         df_list[display_cols],
         use_container_width=True,
@@ -511,19 +584,17 @@ elif page == "👤 Employee Editor":
         selection_mode="single-row",
     )
 
-    if selected_rows and selected_rows.selection.rows:
-        idx = selected_rows.selection.rows[0]
-        emp = docs[idx]
+    # Modal dialog for editing
+    @st.dialog("✏️ Edit Employee", width="large")
+    def edit_employee_modal(emp):
         ecn = emp["ECN"]
-
-        st.divider()
-        st.subheader(f"✏️ Edit: {emp.get('Employee', ecn)} (ECN: {ecn})")
+        st.subheader(f"{emp.get('Employee', ecn)} (ECN: {ecn})")
 
         tab1, tab2 = st.tabs(["Edit Fields", "Field History"])
 
         with tab1:
             st.markdown("**Effective Date** — the date from which this change applies:")
-            eff_date = st.date_input("Effective Start Date", value=date.today())
+            eff_date = st.date_input("Effective Start Date", value=date.today(), key=f"eff_date_{ecn}")
             eff_date_str = eff_date.isoformat()
 
             all_fields = [k for k in emp.keys() if not k.startswith("_")]
@@ -540,21 +611,27 @@ elif page == "👤 Employee Editor":
             for i, field in enumerate(ordered_fields):
                 with cols[i % 3]:
                     edit_vals[field] = st.text_input(
-                        field, value=emp.get(field, ""), key=f"edit_{field}"
+                        field, value=emp.get(field, ""), key=f"edit_{ecn}_{field}"
                     )
 
-            if st.button("💾 Save Changes", type="primary"):
+            if st.button("💾 Save Changes", type="primary", key=f"save_{ecn}"):
                 saved = 0
+                errors = []
                 for field, new_val in edit_vals.items():
                     if new_val != emp.get(field, ""):
-                        ok = record_manual_edit(ecn, field, new_val, eff_date_str)
+                        ok, msg = record_manual_edit(ecn, field, new_val, eff_date_str)
                         if ok:
                             saved += 1
+                        else:
+                            errors.append(f"{field}: {msg}")
 
+                if errors:
+                    for e in errors:
+                        st.error(e)
                 if saved:
                     st.success(f"✅ {saved} field(s) updated, effective {eff_date_str}")
                     st.rerun()
-                else:
+                elif not errors:
                     st.info("No changes detected.")
 
         with tab2:
@@ -566,6 +643,11 @@ elif page == "👤 Employee Editor":
                 st.dataframe(display, use_container_width=True, hide_index=True)
             else:
                 st.info("No history found for this employee.")
+
+    if selected_rows and selected_rows.selection.rows:
+        idx = selected_rows.selection.rows[0]
+        emp = docs[idx]
+        edit_employee_modal(emp)
 
 
 # ─── PAGE: DATE SNAPSHOT ──────────────────────────────────────────────────────
