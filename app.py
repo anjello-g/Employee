@@ -173,6 +173,48 @@ def get_effective_dates(row: dict, upload_date: str) -> tuple:
 
     return eff_from, eff_to
 
+def generate_template_bytes() -> bytes:
+    """Generate an Excel template with all recommended columns."""
+    template_data = {
+        "ECN": ["EMP001", "EMP002"],
+        "Employee": ["John Doe", "Jane Smith"],
+        "DOJ Knack": ["2024-01-15", "2024-03-01"],
+        "Date of Separation": ["", ""],
+        "Effective From": ["", ""],
+        "Effective To": ["", ""],
+        "Client": ["ABC Corp", "XYZ Inc"],
+        "Sub-Process": ["Support", "Billing"],
+        "Supervisor": ["Manager A", "Manager B"],
+        "Role": ["Agent", "Senior Agent"],
+        "Manager": ["Director X", "Director Y"],
+        "DOJ Project": ["2024-01-15", "2024-03-01"],
+        "Shift Timing": ["9AM-6PM", "10AM-7PM"],
+        "Email": ["john@company.com", "jane@company.com"],
+        "NT Login": ["jdoe", "jsmith"],
+        "Structure": ["Ops", "Ops"],
+        "Billable/Buffer": ["Billable", "Buffer"],
+        "Process Owner": ["Owner 1", "Owner 2"],
+        "Department": ["Customer Service", "Finance"],
+        "Location": ["Manila", "Cebu"],
+        "Allocated Seats": ["A1", "B2"],
+        "Gender": ["Male", "Female"],
+        "Seat Number": ["101", "102"],
+        "Global ID (GPP)": ["GPP001", "GPP002"],
+        "Active/Inactive": ["Active", "Active"],
+        "CDP Email": ["john.cdp@company.com", "jane.cdp@company.com"],
+        "BufferAgent": ["", ""],
+        "EWS Type": ["", ""],
+        "Driver": ["", ""],
+        "Expected Move Date": ["", ""],
+        "Overall Location": ["PH", "PH"],
+        "Client Approved Billable": ["Yes", "No"],
+        "Tagging": ["", ""],
+        "Role Tagging": ["", ""],
+        "Specialty": ["", ""],
+    }
+    df = pd.DataFrame(template_data)
+    return df_to_excel_bytes(df, sheet_name="Consolidated Staffing")
+
 # ─── CORE LOGIC ──────────────────────────────────────────────────────────────
 BATCH_SIZE = 5000
 
@@ -441,6 +483,52 @@ def get_employee_history(ecn: str) -> pd.DataFrame:
     return pd.DataFrame(docs)
 
 
+def delete_history_record(ecn: str, field: str, start_date: str):
+    """Delete a history record and restore previous value if needed."""
+    hist = get_history_col()
+    col = get_employees_col()
+    if hist is None or col is None:
+        return False, "Database not connected"
+
+    try:
+        # Find the record to delete
+        record = hist.find_one({"ECN": ecn, "field": field, "start_date": start_date})
+        if not record:
+            return False, "Record not found"
+
+        # Delete the record
+        hist.delete_one({"ECN": ecn, "field": field, "start_date": start_date})
+
+        # Find the previous record to restore
+        prev_record = hist.find_one(
+            {"ECN": ecn, "field": field, "end_date": start_date},
+            sort=[("start_date", -1)]
+        )
+
+        if prev_record:
+            # Restore the previous record's end date to ongoing
+            hist.update_one(
+                {"ECN": ecn, "field": field, "start_date": prev_record["start_date"]},
+                {"$set": {"end_date": "9999-12-31"}}
+            )
+            # Update current employee record
+            col.update_one(
+                {"ECN": ecn},
+                {"$set": {field: prev_record["value"], "_updated_at": prev_record["start_date"]}}
+            )
+        else:
+            # No previous record, clear the field
+            col.update_one(
+                {"ECN": ecn},
+                {"$set": {field: "", "_updated_at": start_date}}
+            )
+
+        return True, "Deleted and restored previous value"
+
+    except Exception as e:
+        return False, f"Error: {str(e)[:100]}"
+
+
 def compact_history():
     hist = get_history_col()
     if hist is None:
@@ -470,6 +558,7 @@ with st.sidebar:
         "👤 Employee Editor",
         "📅 Date Snapshot",
         "📊 Export Data",
+        "📜 History Manager",
         "🛠️ DB Tools",
     ])
 
@@ -481,6 +570,20 @@ if page == "📤 Upload / Sync":
     if not db_connected():
         st.error("Please configure a valid MongoDB URI in Streamlit Secrets first.")
         st.stop()
+
+    # Template download
+    st.subheader("📋 Template")
+    st.markdown("Download the template to see the required format:")
+    template_bytes = generate_template_bytes()
+    st.download_button(
+        label="⬇️ Download Excel Template",
+        data=template_bytes,
+        file_name="staffing_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help="Download a template with all recommended columns and sample data"
+    )
+
+    st.divider()
 
     col1, col2 = st.columns([2, 1])
     with col1:
@@ -808,9 +911,9 @@ elif page == "📊 Export Data":
             st.stop()
 
         if export_mode == "Single sheet (all dates appended with Date Exported column)":
-            # Build single DataFrame with all dates
+            # Build single DataFrame with all dates - NO progress bar to avoid hanging
             all_dfs = []
-            progress_bar = st.progress(0, text="Building export...")
+            status_text = st.empty()
 
             for i in range(days):
                 d = (start_dt + timedelta(days=i)).date().isoformat()
@@ -826,7 +929,9 @@ elif page == "📊 Export Data":
                     df_day["Date Exported"] = d
                     all_dfs.append(df_day)
 
-                progress_bar.progress((i + 1) / days, text=f"Processing {d}...")
+                # Update status every 10 days to avoid UI lag
+                if i % 10 == 0 or i == days - 1:
+                    status_text.text(f"Processing... {i + 1}/{days} days")
 
             if not all_dfs:
                 st.warning("No data found for the selected range.")
@@ -861,7 +966,7 @@ elif page == "📊 Export Data":
                 wb = writer.book
                 header_fmt = wb.add_format({"bold": True, "bg_color": "#1f4e79", "font_color": "white"})
 
-                progress_bar = st.progress(0, text="Building sheets...")
+                status_text = st.empty()
                 for i in range(days):
                     d = (start_dt + timedelta(days=i)).date().isoformat()
                     df_day = get_employees_at_date(d)
@@ -875,7 +980,9 @@ elif page == "📊 Export Data":
                     ws = writer.sheets[sheet_name]
                     for col_num, col_name in enumerate(df_day.columns):
                         ws.write(0, col_num, col_name, header_fmt)
-                    progress_bar.progress((i + 1) / days, text=f"Building {d}...")
+                    
+                    if i % 5 == 0 or i == days - 1:
+                        status_text.text(f"Building sheets... {i + 1}/{days}")
 
             st.success(f"✅ {days} daily sheets generated!")
             st.download_button(
@@ -884,6 +991,131 @@ elif page == "📊 Export Data":
                 file_name=f"staffing_{label}_daily.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+
+
+# ─── PAGE: HISTORY MANAGER ───────────────────────────────────────────────────
+elif page == "📜 History Manager":
+    st.title("📜 History Manager")
+    st.markdown("View, edit, and delete history records. Use this to correct errors in historical data.")
+
+    if not db_connected():
+        st.error("Connect MongoDB first.")
+        st.stop()
+
+    # Search for employee
+    search = st.text_input("🔍 Search by ECN or Employee name", placeholder="e.g. EMP001 or John Doe")
+
+    hist = get_history_col()
+    col = get_employees_col()
+
+    query = {}
+    if search:
+        query["$or"] = [
+            {"ECN": {"$regex": search, "$options": "i"}},
+            {"Employee": {"$regex": search, "$options": "i"}},
+        ]
+
+    # Get all history records
+    history_docs = list(hist.find(query, {"_id": 0}).sort([("ECN", 1), ("field", 1), ("start_date", -1)]).limit(500))
+
+    if not history_docs:
+        st.info("No history records found.")
+        st.stop()
+
+    # Convert to DataFrame for display
+    hist_df = pd.DataFrame(history_docs)
+
+    # Add action buttons
+    st.markdown(f"**{len(hist_df)} history records found** (max 500 shown)")
+
+    # Display with selection
+    display_cols = ["ECN", "Employee", "field", "value", "prev_value", "start_date", "end_date", "source"]
+    display_cols = [c for c in display_cols if c in hist_df.columns]
+
+    selected = st.dataframe(
+        hist_df[display_cols],
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+    )
+
+    if selected and selected.selection.rows:
+        idx = selected.selection.rows[0]
+        record = history_docs[idx]
+
+        st.divider()
+        st.subheader("🛠️ Manage Record")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown(f"**ECN:** {record['ECN']}")
+            st.markdown(f"**Employee:** {record.get('Employee', 'N/A')}")
+            st.markdown(f"**Field:** {record['field']}")
+        with col2:
+            st.markdown(f"**Value:** {record['value']}")
+            st.markdown(f"**Previous:** {record.get('prev_value', 'N/A')}")
+            st.markdown(f"**Period:** {record['start_date']} → {record['end_date']}")
+
+        st.divider()
+
+        # Edit option
+        with st.expander("✏️ Edit this record"):
+            new_value = st.text_input("New Value", value=record["value"], key=f"edit_hist_{idx}")
+            new_start = st.text_input("Start Date", value=record["start_date"], key=f"start_hist_{idx}")
+            new_end = st.text_input("End Date (9999-12-31 for ongoing)", value=record["end_date"], key=f"end_hist_{idx}")
+
+            if st.button("💾 Update Record", type="primary", key=f"update_hist_{idx}"):
+                try:
+                    hist.update_one(
+                        {"ECN": record["ECN"], "field": record["field"], "start_date": record["start_date"]},
+                        {"$set": {
+                            "value": new_value,
+                            "start_date": new_start,
+                            "end_date": new_end,
+                        }}
+                    )
+                    # Update current employee record if this is the active one
+                    if new_end == "9999-12-31":
+                        col.update_one(
+                            {"ECN": record["ECN"]},
+                            {"$set": {record["field"]: new_value}}
+                        )
+                    st.success("✅ Record updated!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {str(e)[:100]}")
+
+        # Delete option
+        with st.expander("🗑️ Delete this record"):
+            st.warning("This will delete the history record and restore the previous value if available.")
+            if st.button("🗑️ Confirm Delete", type="primary", key=f"del_hist_{idx}"):
+                ok, msg = delete_history_record(record["ECN"], record["field"], record["start_date"])
+                if ok:
+                    st.success(f"✅ {msg}")
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    # Bulk operations
+    st.divider()
+    st.subheader("Bulk Operations")
+
+    if st.button("🧹 Remove Redundant Records (value == prev_value)"):
+        with st.spinner("Cleaning..."):
+            deleted = compact_history()
+        st.success(f"Removed **{deleted}** redundant records")
+
+    if st.button("📊 Show History Statistics"):
+        pipeline = [
+            {"$group": {"_id": "$field", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}}
+        ]
+        stats = list(hist.aggregate(pipeline))
+        if stats:
+            stats_df = pd.DataFrame(stats)
+            stats_df.columns = ["Field", "Change Count"]
+            st.dataframe(stats_df, use_container_width=True, hide_index=True)
 
 
 # ─── PAGE: DB TOOLS ───────────────────────────────────────────────────────────
