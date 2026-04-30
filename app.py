@@ -5,13 +5,12 @@ from datetime import date, datetime, timedelta
 import io
 import os
 import calendar
-from urllib.parse import quote_plus, urlparse, urlunparse
-from pymongo import MongoClient, UpdateOne
-from pymongo.errors import BulkWriteError, ServerSelectionTimeoutError, InvalidURI
-import warnings
-warnings.filterwarnings("ignore")
 import certifi
 from urllib.parse import quote_plus, urlparse, urlunparse
+from pymongo import MongoClient, UpdateOne
+from pymongo.errors import BulkWriteError
+import warnings
+warnings.filterwarnings("ignore")
 
 # ─── PAGE CONFIG ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -64,36 +63,33 @@ def get_db():
             connectTimeoutMS=10000,
             socketTimeoutMS=30000,
             tls=True,
-            tlsCAFile=certifi.where(),  # <-- Fixes the SSL handshake
+            tlsCAFile=certifi.where(),
             retryWrites=True,
             w="majority",
         )
         client.admin.command("ping")
         db = client["staffing_db"]
 
-        # Indexes
         db["employees"].create_index("ECN", unique=True)
         db["history"].create_index([("ECN", 1), ("field", 1), ("start_date", 1)])
         db["history"].create_index([("ECN", 1), ("field", 1), ("end_date", 1)])
         db["upload_log"].create_index("upload_date")
         return client, db
-
     except Exception as e:
         st.session_state["_mongo_err"] = str(e)
         return None, None
 
-
 def get_employees_col():
     _, db = get_db()
-    return db["employees"] if db else None
+    return db["employees"] if db is not None else None
 
 def get_history_col():
     _, db = get_db()
-    return db["history"] if db else None
+    return db["history"] if db is not None else None
 
 def get_upload_log_col():
     _, db = get_db()
-    return db["upload_log"] if db else None
+    return db["upload_log"] if db is not None else None
 
 def db_connected():
     _, db = get_db()
@@ -162,14 +158,12 @@ def upsert_employees(df: pd.DataFrame, upload_date: str):
         existing = col.find_one({"ECN": ecn}, {"_id": 0})
 
         if existing is None:
-            # ── NEW EMPLOYEE ──
             doc["_created_at"] = upload_date
             doc["_updated_at"] = upload_date
             doc["_last_upload"] = upload_date
             ops.append(UpdateOne({"ECN": ecn}, {"$set": doc}, upsert=True))
             inserted += 1
 
-            # Seed history for all non-empty fields (baseline = 2000-01-01 so historical queries work)
             for field, val in doc.items():
                 if field.startswith("_") or val == "":
                     continue
@@ -188,7 +182,6 @@ def upsert_employees(df: pd.DataFrame, upload_date: str):
                     upsert=True
                 ))
         else:
-            # ── EXISTING EMPLOYEE ──
             changed = False
             for field, new_val in doc.items():
                 if field.startswith("_"):
@@ -196,7 +189,6 @@ def upsert_employees(df: pd.DataFrame, upload_date: str):
                 old_val = existing.get(field, "")
 
                 if new_val != old_val:
-                    # Respect manual edits: skip if manually edited after last upload
                     last_manual = hist.find_one({
                         "ECN": ecn,
                         "field": field,
@@ -208,13 +200,11 @@ def upsert_employees(df: pd.DataFrame, upload_date: str):
                         skipped_manual += 1
                         continue
 
-                    # Close previous open history
                     hist_ops.append(UpdateOne(
                         {"ECN": ecn, "field": field, "end_date": "9999-12-31"},
                         {"$set": {"end_date": upload_date}}
                     ))
 
-                    # Open new history
                     hist_ops.append(UpdateOne(
                         {"ECN": ecn, "field": field, "start_date": upload_date},
                         {"$set": {
@@ -232,19 +222,14 @@ def upsert_employees(df: pd.DataFrame, upload_date: str):
                     changed = True
 
             if changed:
-                doc["_updated_at"] = upload_date
-                doc["_last_upload"] = upload_date
-                # Only update fields present in Excel (allows column flexibility)
                 update_doc = {k: v for k, v in doc.items() if not k.startswith("_")}
                 update_doc["_updated_at"] = upload_date
                 update_doc["_last_upload"] = upload_date
                 ops.append(UpdateOne({"ECN": ecn}, {"$set": update_doc}))
                 updated += 1
             else:
-                # Still mark as seen in this upload
                 ops.append(UpdateOne({"ECN": ecn}, {"$set": {"_last_upload": upload_date}}))
 
-    # Bulk execute
     if ops:
         try:
             col.bulk_write(ops, ordered=False)
@@ -270,7 +255,6 @@ def upsert_employees(df: pd.DataFrame, upload_date: str):
 
 
 def get_employees_at_date(query_date: str) -> pd.DataFrame:
-    """Return snapshot of all employees at a specific date, applying history overrides."""
     col = get_employees_col()
     hist = get_history_col()
     if col is None:
@@ -282,7 +266,6 @@ def get_employees_at_date(query_date: str) -> pd.DataFrame:
 
     df = pd.DataFrame(docs)
 
-    # Apply history overrides active on query_date
     hist_docs = list(hist.find(
         {"start_date": {"$lte": query_date}, "end_date": {"$gt": query_date}},
         {"_id": 0, "ECN": 1, "field": 1, "value": 1}
@@ -299,14 +282,12 @@ def get_employees_at_date(query_date: str) -> pd.DataFrame:
             mask = df["ECN"] == ecn
             df.loc[mask, field] = val
 
-    # Drop internal fields
     internal = [c for c in df.columns if c.startswith("_")]
     df = df.drop(columns=internal, errors="ignore")
     return df
 
 
 def record_manual_edit(ecn: str, field: str, new_value: str, start_date: str):
-    """Record a manual in-app edit with a specific effective start date."""
     col = get_employees_col()
     hist = get_history_col()
     if col is None or hist is None:
@@ -318,13 +299,11 @@ def record_manual_edit(ecn: str, field: str, new_value: str, start_date: str):
 
     old_value = existing.get(field, "")
 
-    # Close any open history entry that overlaps
     hist.update_many(
         {"ECN": ecn, "field": field, "end_date": "9999-12-31", "start_date": {"$lte": start_date}},
         {"$set": {"end_date": start_date}}
     )
 
-    # Insert new history record
     hist.update_one(
         {"ECN": ecn, "field": field, "start_date": start_date},
         {"$set": {
@@ -340,7 +319,6 @@ def record_manual_edit(ecn: str, field: str, new_value: str, start_date: str):
         upsert=True
     )
 
-    # Update current record
     col.update_one(
         {"ECN": ecn},
         {"$set": {field: new_value, "_updated_at": start_date}}
@@ -359,14 +337,9 @@ def get_employee_history(ecn: str) -> pd.DataFrame:
 
 
 def compact_history():
-    """Remove duplicate/obsolete history entries to save space (512 MB limit)."""
     hist = get_history_col()
-    col = get_employees_col()
-    if hist is None or col is None:
+    if hist is None:
         return 0
-
-    # Find consecutive identical values and merge them
-    # This is a simple cleanup: delete history where value == prev_value
     result = hist.delete_many({"$expr": {"$eq": ["$value", "$prev_value"]}})
     return result.deleted_count
 
@@ -377,19 +350,7 @@ with st.sidebar:
     st.title("Staffing App")
     st.divider()
 
-    # Secrets / Env input
-    mongo_uri_input = st.text_input(
-        "MongoDB URI",
-        value=os.environ.get("MONGO_URI", ""),
-        type="password",
-        placeholder="mongodb+srv://user:pass@cluster.mongodb.net/",
-        help="Paste your MongoDB Atlas connection string. Special chars in password are auto-escaped."
-    )
-    if mongo_uri_input:
-        os.environ["MONGO_URI"] = mongo_uri_input
-        st.cache_resource.clear()
-
-    # Connection status
+    # Connection status only — no URI input
     if db_connected():
         st.success("✅ MongoDB Connected")
     else:
@@ -414,7 +375,7 @@ if page == "📤 Upload / Sync":
     st.markdown("Upload the **Consolidated Staffing** Excel file to populate or update the database.")
 
     if not db_connected():
-        st.error("Please configure a valid MongoDB URI in the sidebar first.")
+        st.error("Please configure a valid MongoDB URI in Streamlit Secrets first.")
         st.stop()
 
     col1, col2 = st.columns([2, 1])
@@ -461,7 +422,6 @@ if page == "📤 Upload / Sync":
                 - **{total:,}** total employees in DB
                 """)
 
-    # DB Stats
     st.divider()
     st.subheader("📊 Database Stats")
     col = get_employees_col()
@@ -471,9 +431,8 @@ if page == "📤 Upload / Sync":
         c1.metric("Total Employees", f"{col.count_documents({}):,}")
         c2.metric("Active", f"{col.count_documents({'Active/Inactive': 'Active'}):,}")
         c3.metric("Inactive", f"{col.count_documents({'Active/Inactive': 'Inactive'}):,}")
-        c4.metric("History Records", f"{hist.count_documents({}):,}" if hist else "—")
+        c4.metric("History Records", f"{hist.count_documents({}):,}" if hist is not None else "—")
 
-        # Storage estimate
         try:
             db_stats = col.database.command("dbStats")
             used_mb = db_stats.get("dataSize", 0) / (1024 * 1024)
@@ -493,7 +452,6 @@ elif page == "👤 Employee Editor":
         st.error("Connect MongoDB first.")
         st.stop()
 
-    # Search
     search = st.text_input("🔍 Search by name, ECN, or email", placeholder="e.g. Santos, 12345")
     filter_status = st.selectbox("Filter by Status", ["All", "Active", "Inactive", "LOA", "Maternity", "Suspended"])
 
@@ -541,9 +499,7 @@ elif page == "👤 Employee Editor":
             eff_date = st.date_input("Effective Start Date", value=date.today())
             eff_date_str = eff_date.isoformat()
 
-            # All fields except internal ones
             all_fields = [k for k in emp.keys() if not k.startswith("_")]
-            # Separate tracked vs non-tracked for UI clarity, but ALL are editable with history
             preferred_first = ["Billable/Buffer", "Active/Inactive", "Client", "Sub-Process",
                                "Supervisor", "Role", "Manager", "Location", "Overall Location",
                                "Shift Timing", "Structure", "Tagging", "Role Tagging",
@@ -617,7 +573,6 @@ elif page == "📅 Date Snapshot":
 
             st.success(f"✅ Snapshot for **{snap_str}** — **{len(df):,} employees**")
 
-            # Summary metrics
             m1, m2, m3, m4 = st.columns(4)
             if "Billable/Buffer" in df.columns:
                 m1.metric("Billable", len(df[df["Billable/Buffer"] == "Billable"]))
@@ -634,7 +589,6 @@ elif page == "📅 Date Snapshot":
 
             st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
 
-            # Download button
             excel_bytes = df_to_excel_bytes(df, sheet_name=f"Snapshot_{snap_str}")
             st.download_button(
                 label=f"⬇️ Download Snapshot ({snap_str})",
@@ -688,7 +642,7 @@ elif page == "📊 Export Data":
         end_date = date(year, 12, 31).isoformat()
         label = f"yearly_{year}"
 
-    else:  # Custom
+    else:
         col1, col2 = st.columns(2)
         with col1:
             start = st.date_input("Start date", value=today - timedelta(days=7))
@@ -728,7 +682,6 @@ elif page == "📊 Export Data":
             )
 
         else:
-            # Daily snapshots
             start_dt = datetime.strptime(start_date, "%Y-%m-%d")
             end_dt = datetime.strptime(end_date, "%Y-%m-%d")
             days = (end_dt - start_dt).days + 1
@@ -750,7 +703,7 @@ elif page == "📊 Export Data":
                         if filter_client2 and "Client" in df_day.columns:
                             df_day = df_day[df_day["Client"].str.contains(filter_client2, case=False, na=False)]
 
-                        sheet_name = d.replace("-", "")[-6:]  # MMDDYY
+                        sheet_name = d.replace("-", "")[-6:]
                         df_day.to_excel(writer, index=False, sheet_name=sheet_name)
                         ws = writer.sheets[sheet_name]
                         for col_num, col_name in enumerate(df_day.columns):
