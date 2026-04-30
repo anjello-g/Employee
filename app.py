@@ -7,10 +7,17 @@ import os
 import calendar
 import certifi
 from urllib.parse import quote_plus, urlparse, urlunparse
-from pymongo import MongoClient, UpdateOne
-from pymongo.errors import BulkWriteError, DuplicateKeyError
 import warnings
 warnings.filterwarnings("ignore")
+
+# Try TiDB (PyMySQL/SQLAlchemy), fallback to pymongo if needed
+try:
+    import pymysql
+    from sqlalchemy import create_engine, text, MetaData, Table, Column, String, DateTime, Integer, JSON
+    from sqlalchemy.orm import sessionmaker
+    TIDB_AVAILABLE = True
+except ImportError:
+    TIDB_AVAILABLE = False
 
 # ─── PAGE CONFIG ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -20,9 +27,9 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ─── MONGODB CONNECTION ──────────────────────────────────────────────────────
+# ─── DATABASE CONNECTION ──────────────────────────────────────────────────────
 def parse_and_escape_uri(uri: str) -> str:
-    if not uri or not uri.startswith("mongodb"):
+    if not uri or not uri.startswith(("mysql", "mongodb")):
         return uri
     try:
         parsed = urlparse(uri)
@@ -44,54 +51,96 @@ def parse_and_escape_uri(uri: str) -> str:
 def get_db():
     uri = ""
     try:
-        uri = st.secrets.get("MONGO_URI", "")
+        uri = st.secrets.get("TIDB_URI", "")
     except Exception:
         pass
     if not uri:
-        uri = os.environ.get("MONGO_URI", "")
+        uri = os.environ.get("TIDB_URI", "")
     if not uri:
         return None, None
 
     uri = parse_and_escape_uri(uri)
 
-    try:
-        client = MongoClient(
-            uri,
-            serverSelectionTimeoutMS=10000,
-            connectTimeoutMS=10000,
-            socketTimeoutMS=30000,
-            tls=True,
-            tlsCAFile=certifi.where(),
-            retryWrites=True,
-            w="majority",
-        )
-        client.admin.command("ping")
-        db = client["staffing_db"]
-
-        db["employees"].create_index("ECN", unique=True)
-        db["history"].create_index([("ECN", 1), ("field", 1), ("start_date", 1)])
-        db["history"].create_index([("ECN", 1), ("field", 1), ("end_date", 1)])
-        db["upload_log"].create_index("upload_date")
-        return client, db
-    except Exception as e:
-        st.session_state["_mongo_err"] = str(e)
+    if not TIDB_AVAILABLE:
+        st.session_state["_db_err"] = "TiDB drivers not installed. Add 'PyMySQL>=1.1' and 'SQLAlchemy>=2.0' to requirements.txt"
         return None, None
 
-def get_employees_col():
-    _, db = get_db()
-    return db["employees"] if db is not None else None
+    try:
+        # TiDB connection with SSL
+        engine = create_engine(
+            uri,
+            connect_args={
+                "ssl": {"ca": certifi.where()},
+                "connect_timeout": 10,
+            },
+            pool_pre_ping=True,
+            pool_recycle=3600,
+        )
+        # Test connection
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
 
-def get_history_col():
-    _, db = get_db()
-    return db["history"] if db is not None else None
+        # Create tables if not exist
+        metadata = MetaData()
 
-def get_upload_log_col():
-    _, db = get_db()
-    return db["upload_log"] if db is not None else None
+        # Employees table - flexible JSON for dynamic columns
+        employees = Table(
+            'employees', metadata,
+            Column('ecn', String(50), primary_key=True),
+            Column('data', JSON),
+            Column('created_at', String(10)),
+            Column('updated_at', String(10)),
+            Column('last_upload', String(10)),
+            mysql_engine='InnoDB'
+        )
+
+        # History table
+        history = Table(
+            'history', metadata,
+            Column('id', Integer, primary_key=True, autoincrement=True),
+            Column('ecn', String(50), index=True),
+            Column('employee_name', String(200)),
+            Column('field', String(100), index=True),
+            Column('value', String(500)),
+            Column('prev_value', String(500)),
+            Column('start_date', String(10), index=True),
+            Column('end_date', String(10), index=True),
+            Column('source', String(20)),
+            mysql_engine='InnoDB'
+        )
+
+        # Upload log
+        upload_log = Table(
+            'upload_log', metadata,
+            Column('id', Integer, primary_key=True, autoincrement=True),
+            Column('upload_date', String(10), index=True),
+            Column('rows_processed', Integer),
+            Column('inserted', Integer),
+            Column('updated', Integer),
+            Column('skipped_manual', Integer),
+            mysql_engine='InnoDB'
+        )
+
+        metadata.create_all(engine)
+
+        return engine, metadata
+    except Exception as e:
+        st.session_state["_db_err"] = str(e)
+        return None, None
+
+def get_engine():
+    engine, _ = get_db()
+    return engine
+
+def get_table(name):
+    _, metadata = get_db()
+    if metadata is None:
+        return None
+    return Table(name, metadata, autoload_with=get_engine())
 
 def db_connected():
-    _, db = get_db()
-    return db is not None
+    engine, _ = get_db()
+    return engine is not None
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 def safe_str(v):
@@ -157,7 +206,6 @@ def df_to_excel_bytes(df: pd.DataFrame, sheet_name="Staffing") -> bytes:
     return buf.getvalue()
 
 def get_effective_dates(row: dict, upload_date: str) -> tuple:
-    """Extract Effective From/To from row, fallback to DOJ Knack or upload date."""
     eff_from = parse_date(row.get("Effective From", ""))
     eff_to = parse_date(row.get("Effective To", ""))
 
@@ -174,7 +222,6 @@ def get_effective_dates(row: dict, upload_date: str) -> tuple:
     return eff_from, eff_to
 
 def generate_template_bytes() -> bytes:
-    """Generate an Excel template with all recommended columns."""
     template_data = {
         "ECN": ["EMP001", "EMP002"],
         "Employee": ["John Doe", "Jane Smith"],
@@ -216,45 +263,55 @@ def generate_template_bytes() -> bytes:
     return df_to_excel_bytes(df, sheet_name="Consolidated Staffing")
 
 # ─── CORE LOGIC ──────────────────────────────────────────────────────────────
-BATCH_SIZE = 5000
+BATCH_SIZE = 1000
 
-def flush_batches(col, hist, emp_ops, hist_ops):
-    if emp_ops:
-        try:
-            col.bulk_write(emp_ops, ordered=False)
-        except BulkWriteError:
-            pass
-    if hist_ops:
-        try:
-            hist.bulk_write(hist_ops, ordered=False)
-        except BulkWriteError:
-            pass
+def get_employee(engine, ecn):
+    """Get employee by ECN."""
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT data FROM employees WHERE ecn = :ecn"),
+            {"ecn": ecn}
+        ).fetchone()
+        if result:
+            import json
+            data = json.loads(result[0]) if isinstance(result[0], str) else result[0]
+            data["ECN"] = ecn
+            return data
+        return None
+
+def get_all_employees(engine):
+    """Get all employees as list of dicts."""
+    with engine.connect() as conn:
+        results = conn.execute(text("SELECT ecn, data FROM employees")).fetchall()
+        employees = []
+        for row in results:
+            import json
+            data = json.loads(row[1]) if isinstance(row[1], str) else row[1]
+            data["ECN"] = row[0]
+            employees.append(data)
+        return employees
 
 def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
-    col = get_employees_col()
-    hist = get_history_col()
-    log = get_upload_log_col()
-    if col is None or hist is None:
+    engine = get_engine()
+    if engine is None:
         return 0, 0, "Database not connected"
 
     total_rows = len(df)
 
-    # ── PRELOAD: all existing employees into dict (ECN -> doc) ──
+    # Preload all employees
     existing_docs = {}
-    for doc in col.find({}, {"_id": 0}):
-        ecn = doc.get("ECN")
-        if ecn:
-            existing_docs[ecn] = doc
+    for emp in get_all_employees(engine):
+        existing_docs[emp["ECN"]] = emp
 
-    # ── PRELOAD: latest manual edit date per (ECN, field) ──
+    # Preload manual edits
     manual_edits = {}
-    for h in hist.find({"source": "manual_edit"}, {"_id": 0, "ECN": 1, "field": 1, "start_date": 1}):
-        key = (h["ECN"], h["field"])
-        if key not in manual_edits or h["start_date"] > manual_edits[key]:
-            manual_edits[key] = h["start_date"]
+    with engine.connect() as conn:
+        results = conn.execute(
+            text("SELECT ecn, field, MAX(start_date) as max_date FROM history WHERE source = 'manual_edit' GROUP BY ecn, field")
+        ).fetchall()
+        for row in results:
+            manual_edits[(row[0], row[1])] = row[2]
 
-    emp_ops = []
-    hist_ops = []
     inserted = 0
     updated = 0
     skipped_manual = 0
@@ -268,39 +325,50 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
         doc["ECN"] = ecn
         existing = existing_docs.get(ecn)
 
-        # Get effective date range from Excel or defaults
         eff_from, eff_to = get_effective_dates(row.to_dict(), upload_date)
 
         if existing is None:
-            # ── NEW EMPLOYEE ──
-            doc["_created_at"] = upload_date
-            doc["_updated_at"] = upload_date
-            doc["_last_upload"] = upload_date
-            emp_ops.append(UpdateOne({"ECN": ecn}, {"$set": doc}, upsert=True))
+            # New employee
+            import json
+            with engine.connect() as conn:
+                conn.execute(
+                    text("INSERT INTO employees (ecn, data, created_at, updated_at, last_upload) VALUES (:ecn, :data, :created, :updated, :upload)"),
+                    {
+                        "ecn": ecn,
+                        "data": json.dumps(doc),
+                        "created": upload_date,
+                        "updated": upload_date,
+                        "upload": upload_date
+                    }
+                )
+                conn.commit()
+
             inserted += 1
 
-            # Only seed history for fields that have values
+            # Seed history for non-empty fields
             for field, val in doc.items():
                 if field.startswith("_") or field in ("Effective From", "Effective To") or val == "":
                     continue
-                hist_ops.append(UpdateOne(
-                    {"ECN": ecn, "field": field, "start_date": eff_from},
-                    {"$set": {
-                        "ECN": ecn,
-                        "Employee": doc.get("Employee", ""),
-                        "field": field,
-                        "value": val,
-                        "prev_value": "",
-                        "start_date": eff_from,
-                        "end_date": eff_to,
-                        "source": "excel_upload",
-                    }},
-                    upsert=True
-                ))
+                with engine.connect() as conn:
+                    conn.execute(
+                        text("""
+                            INSERT INTO history (ecn, employee_name, field, value, prev_value, start_date, end_date, source)
+                            VALUES (:ecn, :emp, :field, :val, '', :start, :end, 'excel_upload')
+                            ON DUPLICATE KEY UPDATE
+                            value = VALUES(value), end_date = VALUES(end_date)
+                        """),
+                        {
+                            "ecn": ecn, "emp": doc.get("Employee", ""),
+                            "field": field, "val": val,
+                            "start": eff_from, "end": eff_to
+                        }
+                    )
+                    conn.commit()
         else:
-            # ── EXISTING EMPLOYEE ──
+            # Existing employee
             changed = False
             last_upload = existing.get("_last_upload", "2000-01-01")
+            import json
 
             for field, new_val in doc.items():
                 if field.startswith("_") or field in ("Effective From", "Effective To"):
@@ -308,105 +376,116 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
                 old_val = existing.get(field, "")
 
                 if new_val != old_val:
-                    # Check against preloaded manual edits
                     manual_date = manual_edits.get((ecn, field))
                     if manual_date and manual_date > last_upload:
                         skipped_manual += 1
                         continue
 
-                    # Close previous open history
-                    hist_ops.append(UpdateOne(
-                        {"ECN": ecn, "field": field, "end_date": "9999-12-31"},
-                        {"$set": {"end_date": upload_date}}
-                    ))
+                    # Close previous history
+                    with engine.connect() as conn:
+                        conn.execute(
+                            text("UPDATE history SET end_date = :upload WHERE ecn = :ecn AND field = :field AND end_date = '9999-12-31'"),
+                            {"upload": upload_date, "ecn": ecn, "field": field}
+                        )
+                        conn.commit()
 
-                    # Insert new history with effective dates from Excel
-                    hist_ops.append(UpdateOne(
-                        {"ECN": ecn, "field": field, "start_date": eff_from},
-                        {"$set": {
-                            "ECN": ecn,
-                            "Employee": doc.get("Employee", existing.get("Employee", "")),
-                            "field": field,
-                            "value": new_val,
-                            "prev_value": old_val,
-                            "start_date": eff_from,
-                            "end_date": eff_to,
-                            "source": "excel_upload",
-                        }},
-                        upsert=True
-                    ))
+                    # Insert new history
+                    with engine.connect() as conn:
+                        conn.execute(
+                            text("""
+                                INSERT INTO history (ecn, employee_name, field, value, prev_value, start_date, end_date, source)
+                                VALUES (:ecn, :emp, :field, :val, :prev, :start, :end, 'excel_upload')
+                                ON DUPLICATE KEY UPDATE
+                                value = VALUES(value), prev_value = VALUES(prev_value), end_date = VALUES(end_date)
+                            """),
+                            {
+                                "ecn": ecn, "emp": doc.get("Employee", existing.get("Employee", "")),
+                                "field": field, "val": new_val, "prev": old_val,
+                                "start": eff_from, "end": eff_to
+                            }
+                        )
+                        conn.commit()
+
                     changed = True
 
             if changed:
-                update_doc = {k: v for k, v in doc.items() if not k.startswith("_") and k not in ("Effective From", "Effective To")}
-                update_doc["_updated_at"] = upload_date
-                update_doc["_last_upload"] = upload_date
-                emp_ops.append(UpdateOne({"ECN": ecn}, {"$set": update_doc}))
+                # Update employee data
+                existing.update(doc)
+                existing["_updated_at"] = upload_date
+                existing["_last_upload"] = upload_date
+                with engine.connect() as conn:
+                    conn.execute(
+                        text("UPDATE employees SET data = :data, updated_at = :updated, last_upload = :upload WHERE ecn = :ecn"),
+                        {
+                            "ecn": ecn,
+                            "data": json.dumps(existing),
+                            "updated": upload_date,
+                            "upload": upload_date
+                        }
+                    )
+                    conn.commit()
                 updated += 1
             else:
-                emp_ops.append(UpdateOne({"ECN": ecn}, {"$set": {"_last_upload": upload_date}}))
+                with engine.connect() as conn:
+                    conn.execute(
+                        text("UPDATE employees SET last_upload = :upload WHERE ecn = :ecn"),
+                        {"ecn": ecn, "upload": upload_date}
+                    )
+                    conn.commit()
 
-        # Flush every BATCH_SIZE
-        if len(emp_ops) >= BATCH_SIZE or len(hist_ops) >= BATCH_SIZE:
-            flush_batches(col, hist, emp_ops, hist_ops)
-            emp_ops = []
-            hist_ops = []
-            if progress_bar is not None:
-                progress_bar.progress(min(0.99, (idx + 1) / total_rows),
-                                      text=f"Processed {idx + 1:,}/{total_rows:,}...")
+        if progress_bar is not None and idx % 50 == 0:
+            progress_bar.progress(min(0.99, (idx + 1) / total_rows),
+                                  text=f"Processed {idx + 1:,}/{total_rows:,}...")
 
-    # Final flush
-    flush_batches(col, hist, emp_ops, hist_ops)
     if progress_bar is not None:
         progress_bar.progress(1.0, text="Done!")
 
-    if log is not None:
-        log.insert_one({
-            "upload_date": upload_date,
-            "rows_processed": total_rows,
-            "inserted": inserted,
-            "updated": updated,
-            "skipped_manual": skipped_manual,
-        })
+    # Log upload
+    with engine.connect() as conn:
+        conn.execute(
+            text("INSERT INTO upload_log (upload_date, rows_processed, inserted, updated, skipped_manual) VALUES (:date, :rows, :ins, :upd, :skip)"),
+            {"date": upload_date, "rows": total_rows, "ins": inserted, "upd": updated, "skip": skipped_manual}
+        )
+        conn.commit()
 
     return inserted, updated, None
 
 
 def get_employees_at_date(query_date: str) -> pd.DataFrame:
-    col = get_employees_col()
-    hist = get_history_col()
-    if col is None:
+    engine = get_engine()
+    if engine is None:
         return pd.DataFrame()
 
-    docs = list(col.find({}, {"_id": 0}))
-    if not docs:
+    employees = get_all_employees(engine)
+    if not employees:
         return pd.DataFrame()
 
-    df = pd.DataFrame(docs)
+    df = pd.DataFrame(employees)
 
-    # Filter out employees not yet hired on query_date
+    # Filter by DOJ
     if "DOJ Knack" in df.columns:
         df["__doj_parsed"] = df["DOJ Knack"].apply(parse_date)
         df = df[df["__doj_parsed"].isna() | (df["__doj_parsed"] <= query_date)]
         df = df.drop(columns=["__doj_parsed"])
 
-    # Filter out employees who already separated before query_date
+    # Filter by separation
     if "Date of Separation" in df.columns:
         df["__sep_parsed"] = df["Date of Separation"].apply(parse_date)
         df = df[df["__sep_parsed"].isna() | (df["__sep_parsed"] >= query_date)]
         df = df.drop(columns=["__sep_parsed"])
 
-    # Apply history overrides active on query_date
-    hist_docs = list(hist.find(
-        {"start_date": {"$lte": query_date}, "end_date": {"$gt": query_date}},
-        {"_id": 0, "ECN": 1, "field": 1, "value": 1}
-    ))
+    # Apply history overrides
+    with engine.connect() as conn:
+        results = conn.execute(
+            text("SELECT ecn, field, value FROM history WHERE start_date <= :date AND end_date > :date"),
+            {"date": query_date}
+        ).fetchall()
 
     overrides = {}
-    for h in hist_docs:
-        key = (h["ECN"], h["field"])
+    for row in results:
+        key = (row[0], row[1])
         if key not in overrides:
-            overrides[key] = h["value"]
+            overrides[key] = row[2]
 
     for (ecn, field), val in overrides.items():
         if field in df.columns:
@@ -419,110 +498,132 @@ def get_employees_at_date(query_date: str) -> pd.DataFrame:
 
 
 def record_manual_edit(ecn: str, field: str, new_value: str, start_date: str, end_date: str = "9999-12-31"):
-    col = get_employees_col()
-    hist = get_history_col()
-    if col is None or hist is None:
+    engine = get_engine()
+    if engine is None:
         return False, "Database not connected"
 
     try:
-        existing = col.find_one({"ECN": ecn})
+        existing = get_employee(engine, ecn)
         if not existing:
             return False, "Employee not found"
 
         old_value = existing.get(field, "")
 
-        # Close any open history entry that overlaps with our new range
-        hist.update_many(
-            {"ECN": ecn, "field": field, "end_date": "9999-12-31", "start_date": {"$lte": start_date}},
-            {"$set": {"end_date": start_date}}
-        )
-
-        # Also close any entries that start within our new range
-        hist.update_many(
-            {"ECN": ecn, "field": field, "start_date": {"$gt": start_date, "$lt": end_date}},
-            {"$set": {"end_date": start_date}}
-        )
-
-        # Insert new history record
-        hist.update_one(
-            {"ECN": ecn, "field": field, "start_date": start_date},
-            {"$set": {
-                "ECN": ecn,
-                "Employee": existing.get("Employee", ""),
-                "field": field,
-                "value": new_value,
-                "prev_value": old_value,
-                "start_date": start_date,
-                "end_date": end_date,
-                "source": "manual_edit",
-            }},
-            upsert=True
-        )
-
-        # Update current record only if this is the ongoing version
-        if end_date == "9999-12-31":
-            col.update_one(
-                {"ECN": ecn},
-                {"$set": {field: new_value, "_updated_at": start_date}}
+        with engine.connect() as conn:
+            # Close overlapping history
+            conn.execute(
+                text("UPDATE history SET end_date = :start WHERE ecn = :ecn AND field = :field AND end_date = '9999-12-31' AND start_date <= :start"),
+                {"start": start_date, "ecn": ecn, "field": field}
             )
+            conn.execute(
+                text("UPDATE history SET end_date = :start WHERE ecn = :ecn AND field = :field AND start_date > :start AND start_date < :end"),
+                {"start": start_date, "end": end_date, "ecn": ecn, "field": field}
+            )
+
+            # Insert new record
+            conn.execute(
+                text("""
+                    INSERT INTO history (ecn, employee_name, field, value, prev_value, start_date, end_date, source)
+                    VALUES (:ecn, :emp, :field, :val, :prev, :start, :end, 'manual_edit')
+                    ON DUPLICATE KEY UPDATE
+                    value = VALUES(value), prev_value = VALUES(prev_value), end_date = VALUES(end_date)
+                """),
+                {
+                    "ecn": ecn, "emp": existing.get("Employee", ""),
+                    "field": field, "val": new_value, "prev": old_value,
+                    "start": start_date, "end": end_date
+                }
+            )
+
+            # Update current record if ongoing
+            if end_date == "9999-12-31":
+                import json
+                existing[field] = new_value
+                existing["_updated_at"] = start_date
+                conn.execute(
+                    text("UPDATE employees SET data = :data, updated_at = :updated WHERE ecn = :ecn"),
+                    {"ecn": ecn, "data": json.dumps(existing), "updated": start_date}
+                )
+
+            conn.commit()
         return True, "Saved"
 
-    except DuplicateKeyError as e:
-        return False, f"Duplicate key error: {str(e)[:100]}"
     except Exception as e:
         return False, f"Error: {str(e)[:100]}"
 
 
 def get_employee_history(ecn: str) -> pd.DataFrame:
-    hist = get_history_col()
-    if hist is None:
+    engine = get_engine()
+    if engine is None:
         return pd.DataFrame()
-    docs = list(hist.find({"ECN": ecn}, {"_id": 0}).sort([("field", 1), ("start_date", -1)]))
-    if not docs:
+
+    with engine.connect() as conn:
+        results = conn.execute(
+            text("SELECT ecn, employee_name, field, value, prev_value, start_date, end_date, source FROM history WHERE ecn = :ecn ORDER BY field, start_date DESC"),
+            {"ecn": ecn}
+        ).fetchall()
+
+    if not results:
         return pd.DataFrame()
-    return pd.DataFrame(docs)
+
+    df = pd.DataFrame(results, columns=["ECN", "Employee", "field", "value", "prev_value", "start_date", "end_date", "source"])
+    return df
 
 
 def delete_history_record(ecn: str, field: str, start_date: str):
-    """Delete a history record and restore previous value if needed."""
-    hist = get_history_col()
-    col = get_employees_col()
-    if hist is None or col is None:
+    engine = get_engine()
+    if engine is None:
         return False, "Database not connected"
 
     try:
-        # Find the record to delete
-        record = hist.find_one({"ECN": ecn, "field": field, "start_date": start_date})
-        if not record:
-            return False, "Record not found"
+        with engine.connect() as conn:
+            # Find record to delete
+            record = conn.execute(
+                text("SELECT * FROM history WHERE ecn = :ecn AND field = :field AND start_date = :start"),
+                {"ecn": ecn, "field": field, "start": start_date}
+            ).fetchone()
 
-        # Delete the record
-        hist.delete_one({"ECN": ecn, "field": field, "start_date": start_date})
+            if not record:
+                return False, "Record not found"
 
-        # Find the previous record to restore
-        prev_record = hist.find_one(
-            {"ECN": ecn, "field": field, "end_date": start_date},
-            sort=[("start_date", -1)]
-        )
-
-        if prev_record:
-            # Restore the previous record's end date to ongoing
-            hist.update_one(
-                {"ECN": ecn, "field": field, "start_date": prev_record["start_date"]},
-                {"$set": {"end_date": "9999-12-31"}}
-            )
-            # Update current employee record
-            col.update_one(
-                {"ECN": ecn},
-                {"$set": {field: prev_record["value"], "_updated_at": prev_record["start_date"]}}
-            )
-        else:
-            # No previous record, clear the field
-            col.update_one(
-                {"ECN": ecn},
-                {"$set": {field: "", "_updated_at": start_date}}
+            # Delete
+            conn.execute(
+                text("DELETE FROM history WHERE ecn = :ecn AND field = :field AND start_date = :start"),
+                {"ecn": ecn, "field": field, "start": start_date}
             )
 
+            # Find previous to restore
+            prev = conn.execute(
+                text("SELECT * FROM history WHERE ecn = :ecn AND field = :field AND end_date = :start ORDER BY start_date DESC LIMIT 1"),
+                {"ecn": ecn, "field": field, "start": start_date}
+            ).fetchone()
+
+            if prev:
+                conn.execute(
+                    text("UPDATE history SET end_date = '9999-12-31' WHERE ecn = :ecn AND field = :field AND start_date = :prev_start"),
+                    {"ecn": ecn, "field": field, "prev_start": prev[5]}
+                )
+
+                # Update current employee
+                import json
+                emp = get_employee(engine, ecn)
+                if emp:
+                    emp[field] = prev[3]
+                    conn.execute(
+                        text("UPDATE employees SET data = :data WHERE ecn = :ecn"),
+                        {"ecn": ecn, "data": json.dumps(emp)}
+                    )
+            else:
+                import json
+                emp = get_employee(engine, ecn)
+                if emp:
+                    emp[field] = ""
+                    conn.execute(
+                        text("UPDATE employees SET data = :data WHERE ecn = :ecn"),
+                        {"ecn": ecn, "data": json.dumps(emp)}
+                    )
+
+            conn.commit()
         return True, "Deleted and restored previous value"
 
     except Exception as e:
@@ -530,11 +631,32 @@ def delete_history_record(ecn: str, field: str, start_date: str):
 
 
 def compact_history():
-    hist = get_history_col()
-    if hist is None:
+    engine = get_engine()
+    if engine is None:
         return 0
-    result = hist.delete_many({"$expr": {"$eq": ["$value", "$prev_value"]}})
-    return result.deleted_count
+
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(
+                text("DELETE FROM history WHERE value = prev_value AND value != ''")
+            )
+            conn.commit()
+            return result.rowcount
+    except Exception:
+        return 0
+
+
+def get_db_stats():
+    engine = get_engine()
+    if engine is None:
+        return None, None, None
+
+    with engine.connect() as conn:
+        emp_count = conn.execute(text("SELECT COUNT(*) FROM employees")).scalar()
+        active_count = conn.execute(text("SELECT COUNT(*) FROM employees WHERE JSON_EXTRACT(data, '$.Active/Inactive') = 'Active'")).scalar()
+        hist_count = conn.execute(text("SELECT COUNT(*) FROM history")).scalar()
+
+    return emp_count, active_count, hist_count
 
 
 # ─── SIDEBAR ─────────────────────────────────────────────────────────────────
@@ -544,13 +666,13 @@ with st.sidebar:
     st.divider()
 
     if db_connected():
-        st.success("✅ MongoDB Connected")
+        st.success("✅ TiDB Connected")
     else:
-        err = st.session_state.get("_mongo_err", "")
+        err = st.session_state.get("_db_err", "")
         if err:
             st.error(f"❌ {err[:120]}")
         else:
-            st.warning("⚠️ No MongoDB URI configured")
+            st.warning("⚠️ No TiDB URI configured")
 
     st.divider()
     page = st.radio("Navigation", [
@@ -568,7 +690,7 @@ if page == "📤 Upload / Sync":
     st.markdown("Upload the **Consolidated Staffing** Excel file to populate or update the database.")
 
     if not db_connected():
-        st.error("Please configure a valid MongoDB URI in Streamlit Secrets first.")
+        st.error("Please configure a valid TiDB URI in Streamlit Secrets first.")
         st.stop()
 
     # Template download
@@ -618,48 +740,38 @@ if page == "📤 Upload / Sync":
             today_str = date.today().isoformat()
             progress = st.progress(0, text="Preparing...")
 
-            with st.spinner("Writing to MongoDB..."):
+            with st.spinner("Writing to TiDB..."):
                 inserted, updated, err = upsert_employees(df, today_str, progress_bar=progress)
 
             if err:
                 st.error(err)
             else:
-                total = get_employees_col().count_documents({})
+                emp_count, _, _ = get_db_stats()
                 st.success(f"""
                 ✅ Sync complete!
                 - **{inserted}** new employees added
                 - **{updated}** existing employees updated
-                - **{total:,}** total employees in DB
+                - **{emp_count:,}** total employees in DB
                 """)
 
     st.divider()
     st.subheader("📊 Database Stats")
-    col = get_employees_col()
-    hist = get_history_col()
-    if col is not None:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Employees", f"{col.count_documents({}):,}")
-        c2.metric("Active", f"{col.count_documents({'Active/Inactive': 'Active'}):,}")
-        c3.metric("Inactive", f"{col.count_documents({'Active/Inactive': 'Inactive'}):,}")
-        c4.metric("History Records", f"{hist.count_documents({}):,}" if hist is not None else "—")
-
-        try:
-            db_stats = col.database.command("dbStats")
-            used_mb = db_stats.get("dataSize", 0) / (1024 * 1024)
-            st.caption(f"Approx. DB size: **{used_mb:.1f} MB** / 512 MB")
-            st.progress(min(1.0, used_mb / 512))
-        except Exception:
-            pass
+    emp_count, active_count, hist_count = get_db_stats()
+    if emp_count is not None:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Employees", f"{emp_count:,}")
+        c2.metric("Active", f"{active_count:,}")
+        c3.metric("History Records", f"{hist_count:,}")
     else:
-        st.info("Connect to MongoDB to see stats.")
+        st.info("Connect to TiDB to see stats.")
 
 
 # ─── PAGE: EMPLOYEE EDITOR ────────────────────────────────────────────────────
 elif page == "👤 Employee Editor":
     st.title("👤 Employee Editor")
-    col = get_employees_col()
-    if col is None:
-        st.error("Connect MongoDB first.")
+    engine = get_engine()
+    if engine is None:
+        st.error("Connect TiDB first.")
         st.stop()
 
     st.info("""
@@ -674,27 +786,33 @@ elif page == "👤 Employee Editor":
     search = st.text_input("🔍 Search by name, ECN, or email", placeholder="e.g. Santos, 12345")
     filter_status = st.selectbox("Filter by Status", ["All", "Active", "Inactive", "LOA", "Maternity", "Suspended"])
 
-    query = {}
-    if filter_status != "All":
-        query["Active/Inactive"] = filter_status
-    if search:
-        query["$or"] = [
-            {"Employee": {"$regex": search, "$options": "i"}},
-            {"ECN": {"$regex": search, "$options": "i"}},
-            {"Email": {"$regex": search, "$options": "i"}},
-        ]
+    # Build query for TiDB
+    employees = get_all_employees(engine)
+    filtered = []
+    for emp in employees:
+        match = True
+        if filter_status != "All":
+            if emp.get("Active/Inactive") != filter_status:
+                match = False
+        if search:
+            search_lower = search.lower()
+            if not (search_lower in emp.get("Employee", "").lower() or
+                    search_lower in emp.get("ECN", "").lower() or
+                    search_lower in emp.get("Email", "").lower()):
+                match = False
+        if match:
+            filtered.append(emp)
 
-    docs = list(col.find(query, {"_id": 0}).limit(200))
-    if not docs:
+    if not filtered:
         st.warning("No employees found.")
         st.stop()
 
-    df_list = pd.DataFrame(docs)
+    df_list = pd.DataFrame(filtered)
     display_cols = ["ECN", "Employee", "Client", "Sub-Process", "Role", "Billable/Buffer",
                     "Active/Inactive", "Location", "Overall Location"]
     display_cols = [c for c in display_cols if c in df_list.columns]
 
-    st.markdown(f"**{len(docs)} employees found** (max 200 shown)")
+    st.markdown(f"**{len(filtered)} employees found** (max 200 shown)")
     st.caption("👆 Click any row to edit that employee")
 
     selected_rows = st.dataframe(
@@ -726,42 +844,68 @@ elif page == "👤 Employee Editor":
                 st.error("Effective To must be after Effective From")
                 return
 
-            st.markdown("**Fields** (all changes are tracked with effective dates)")
-            all_fields = [k for k in emp.keys() if not k.startswith("_")]
-            preferred_first = ["Billable/Buffer", "Active/Inactive", "Client", "Sub-Process",
-                               "Supervisor", "Role", "Manager", "Location", "Overall Location",
-                               "Shift Timing", "Structure", "Tagging", "Role Tagging",
-                               "Client Approved Billable"]
-            ordered_fields = [f for f in preferred_first if f in all_fields]
-            ordered_fields += [f for f in all_fields if f not in ordered_fields]
+            # Core fields (always visible)
+            st.markdown("**Core Fields**")
+            core_fields = ["Billable/Buffer", "Active/Inactive", "Client", "Sub-Process",
+                           "Supervisor", "Role", "Manager", "Location", "Overall Location"]
+            core_fields = [f for f in core_fields if f in emp]
 
             edit_vals = {}
             cols = st.columns(3)
-            for i, field in enumerate(ordered_fields):
+            for i, field in enumerate(core_fields):
                 with cols[i % 3]:
                     edit_vals[field] = st.text_input(
-                        field, value=emp.get(field, ""), key=f"edit_{ecn}_{field}"
+                        field, value=emp.get(field, ""), key=f"edit_core_{ecn}_{field}"
                     )
 
+            # Show more toggle
+            show_more = st.toggle("🔽 Show More Fields", key=f"show_more_{ecn}")
+
+            if show_more:
+                st.markdown("**Additional Fields**")
+                other_fields = [k for k in emp.keys() if not k.startswith("_") and k not in core_fields and k not in ("Effective From", "Effective To")]
+                cols2 = st.columns(3)
+                for i, field in enumerate(other_fields):
+                    with cols2[i % 3]:
+                        edit_vals[field] = st.text_input(
+                            field, value=emp.get(field, ""), key=f"edit_extra_{ecn}_{field}"
+                        )
+
+            # Confirm dialog before saving
             if st.button("💾 Save Changes", type="primary", key=f"save_{ecn}"):
-                saved = 0
-                errors = []
+                # Check if any changes were made
+                changes_made = []
                 for field, new_val in edit_vals.items():
                     if new_val != emp.get(field, ""):
-                        ok, msg = record_manual_edit(ecn, field, new_val, eff_from_str, eff_to_str)
-                        if ok:
-                            saved += 1
-                        else:
-                            errors.append(f"{field}: {msg}")
+                        changes_made.append(f"{field}: {emp.get(field, '')} → {new_val}")
 
-                if errors:
-                    for e in errors:
-                        st.error(e)
-                if saved:
-                    st.success(f"✅ {saved} field(s) updated, effective {eff_from_str} to {eff_to_str if eff_to_str != '9999-12-31' else 'ongoing'}")
-                    st.rerun()
-                elif not errors:
+                if not changes_made:
                     st.info("No changes detected.")
+                    return
+
+                # Show confirmation
+                st.warning("**Please confirm the following changes:**")
+                for change in changes_made:
+                    st.markdown(f"- {change}")
+                st.markdown(f"**Effective:** {eff_from_str} to {eff_to_str if eff_to_str != '9999-12-31' else 'ongoing'}")
+
+                if st.button("✅ Confirm Save", type="primary", key=f"confirm_{ecn}"):
+                    saved = 0
+                    errors = []
+                    for field, new_val in edit_vals.items():
+                        if new_val != emp.get(field, ""):
+                            ok, msg = record_manual_edit(ecn, field, new_val, eff_from_str, eff_to_str)
+                            if ok:
+                                saved += 1
+                            else:
+                                errors.append(f"{field}: {msg}")
+
+                    if errors:
+                        for e in errors:
+                            st.error(e)
+                    if saved:
+                        st.success(f"✅ {saved} field(s) updated!")
+                        st.rerun()
 
         with tab2:
             st.markdown(f"**Change history for ECN {ecn}**")
@@ -775,7 +919,7 @@ elif page == "👤 Employee Editor":
 
     if selected_rows and selected_rows.selection.rows:
         idx = selected_rows.selection.rows[0]
-        emp = docs[idx]
+        emp = filtered[idx]
         edit_employee_modal(emp)
 
 
@@ -785,7 +929,7 @@ elif page == "📅 Date Snapshot":
     st.markdown("View staffing data **as it was on any specific date**, applying all historical changes.")
 
     if not db_connected():
-        st.error("Connect MongoDB first.")
+        st.error("Connect TiDB first.")
         st.stop()
 
     snap_date = st.date_input("Select snapshot date", value=date.today())
@@ -842,7 +986,7 @@ elif page == "📊 Export Data":
     st.markdown("Export staffing data for any time range. All dates in one sheet with `Date Exported` column.")
 
     if not db_connected():
-        st.error("Connect MongoDB first.")
+        st.error("Connect TiDB first.")
         st.stop()
 
     exp_type = st.radio("Export Type", ["Daily", "Weekly", "Monthly", "Yearly", "Custom Range"], horizontal=True)
@@ -911,7 +1055,6 @@ elif page == "📊 Export Data":
             st.stop()
 
         if export_mode == "Single sheet (all dates appended with Date Exported column)":
-            # Build single DataFrame with all dates - NO progress bar to avoid hanging
             all_dfs = []
             status_text = st.empty()
 
@@ -929,7 +1072,6 @@ elif page == "📊 Export Data":
                     df_day["Date Exported"] = d
                     all_dfs.append(df_day)
 
-                # Update status every 10 days to avoid UI lag
                 if i % 10 == 0 or i == days - 1:
                     status_text.text(f"Processing... {i + 1}/{days} days")
 
@@ -937,10 +1079,7 @@ elif page == "📊 Export Data":
                 st.warning("No data found for the selected range.")
                 st.stop()
 
-            # Combine all dates into one sheet
             combined_df = pd.concat(all_dfs, ignore_index=True)
-
-            # Reorder columns: Date Exported first
             cols = ["Date Exported"] + [c for c in combined_df.columns if c != "Date Exported"]
             combined_df = combined_df[cols]
 
@@ -956,9 +1095,8 @@ elif page == "📊 Export Data":
             )
 
         else:
-            # One sheet per day (original behavior)
             if days > 31:
-                st.warning("One sheet per day mode is limited to 31 days. Please narrow your range or use Single Sheet mode.")
+                st.warning("One sheet per day mode is limited to 31 days.")
                 st.stop()
 
             buf = io.BytesIO()
@@ -999,36 +1137,40 @@ elif page == "📜 History Manager":
     st.markdown("View, edit, and delete history records. Use this to correct errors in historical data.")
 
     if not db_connected():
-        st.error("Connect MongoDB first.")
+        st.error("Connect TiDB first.")
         st.stop()
+
+    engine = get_engine()
 
     # Search for employee
     search = st.text_input("🔍 Search by ECN or Employee name", placeholder="e.g. EMP001 or John Doe")
 
-    hist = get_history_col()
-    col = get_employees_col()
-
-    query = {}
-    if search:
-        query["$or"] = [
-            {"ECN": {"$regex": search, "$options": "i"}},
-            {"Employee": {"$regex": search, "$options": "i"}},
-        ]
-
     # Get all history records
-    history_docs = list(hist.find(query, {"_id": 0}).sort([("ECN", 1), ("field", 1), ("start_date", -1)]).limit(500))
+    with engine.connect() as conn:
+        if search:
+            results = conn.execute(
+                text("""
+                    SELECT * FROM history 
+                    WHERE ecn LIKE :search OR employee_name LIKE :search 
+                    ORDER BY ecn, field, start_date DESC 
+                    LIMIT 500
+                """),
+                {"search": f"%{search}%"}
+            ).fetchall()
+        else:
+            results = conn.execute(
+                text("SELECT * FROM history ORDER BY ecn, field, start_date DESC LIMIT 500")
+            ).fetchall()
 
-    if not history_docs:
+    if not results:
         st.info("No history records found.")
         st.stop()
 
-    # Convert to DataFrame for display
-    hist_df = pd.DataFrame(history_docs)
+    # Convert to DataFrame
+    hist_df = pd.DataFrame(results, columns=["id", "ECN", "Employee", "field", "value", "prev_value", "start_date", "end_date", "source"])
 
-    # Add action buttons
     st.markdown(f"**{len(hist_df)} history records found** (max 500 shown)")
 
-    # Display with selection
     display_cols = ["ECN", "Employee", "field", "value", "prev_value", "start_date", "end_date", "source"]
     display_cols = [c for c in display_cols if c in hist_df.columns]
 
@@ -1042,45 +1184,53 @@ elif page == "📜 History Manager":
 
     if selected and selected.selection.rows:
         idx = selected.selection.rows[0]
-        record = history_docs[idx]
+        record = results[idx]
 
         st.divider()
         st.subheader("🛠️ Manage Record")
 
         col1, col2 = st.columns(2)
         with col1:
-            st.markdown(f"**ECN:** {record['ECN']}")
-            st.markdown(f"**Employee:** {record.get('Employee', 'N/A')}")
-            st.markdown(f"**Field:** {record['field']}")
+            st.markdown(f"**ECN:** {record[1]}")
+            st.markdown(f"**Employee:** {record[2] or 'N/A'}")
+            st.markdown(f"**Field:** {record[3]}")
         with col2:
-            st.markdown(f"**Value:** {record['value']}")
-            st.markdown(f"**Previous:** {record.get('prev_value', 'N/A')}")
-            st.markdown(f"**Period:** {record['start_date']} → {record['end_date']}")
+            st.markdown(f"**Value:** {record[4]}")
+            st.markdown(f"**Previous:** {record[5] or 'N/A'}")
+            st.markdown(f"**Period:** {record[6]} → {record[7]}")
 
         st.divider()
 
         # Edit option
         with st.expander("✏️ Edit this record"):
-            new_value = st.text_input("New Value", value=record["value"], key=f"edit_hist_{idx}")
-            new_start = st.text_input("Start Date", value=record["start_date"], key=f"start_hist_{idx}")
-            new_end = st.text_input("End Date (9999-12-31 for ongoing)", value=record["end_date"], key=f"end_hist_{idx}")
+            new_value = st.text_input("New Value", value=record[4], key=f"edit_hist_{idx}")
+            new_start = st.text_input("Start Date", value=record[6], key=f"start_hist_{idx}")
+            new_end = st.text_input("End Date (9999-12-31 for ongoing)", value=record[7], key=f"end_hist_{idx}")
 
             if st.button("💾 Update Record", type="primary", key=f"update_hist_{idx}"):
                 try:
-                    hist.update_one(
-                        {"ECN": record["ECN"], "field": record["field"], "start_date": record["start_date"]},
-                        {"$set": {
-                            "value": new_value,
-                            "start_date": new_start,
-                            "end_date": new_end,
-                        }}
-                    )
-                    # Update current employee record if this is the active one
-                    if new_end == "9999-12-31":
-                        col.update_one(
-                            {"ECN": record["ECN"]},
-                            {"$set": {record["field"]: new_value}}
+                    with engine.connect() as conn:
+                        conn.execute(
+                            text("""
+                                UPDATE history 
+                                SET value = :val, start_date = :start, end_date = :end 
+                                WHERE id = :id
+                            """),
+                            {"val": new_value, "start": new_start, "end": new_end, "id": record[0]}
                         )
+                        
+                        # Update current employee record if this is the active one
+                        if new_end == "9999-12-31":
+                            emp = get_employee(engine, record[1])
+                            if emp:
+                                import json
+                                emp[record[3]] = new_value
+                                conn.execute(
+                                    text("UPDATE employees SET data = :data WHERE ecn = :ecn"),
+                                    {"data": json.dumps(emp), "ecn": record[1]}
+                                )
+                        
+                        conn.commit()
                     st.success("✅ Record updated!")
                     st.rerun()
                 except Exception as e:
@@ -1090,7 +1240,7 @@ elif page == "📜 History Manager":
         with st.expander("🗑️ Delete this record"):
             st.warning("This will delete the history record and restore the previous value if available.")
             if st.button("🗑️ Confirm Delete", type="primary", key=f"del_hist_{idx}"):
-                ok, msg = delete_history_record(record["ECN"], record["field"], record["start_date"])
+                ok, msg = delete_history_record(record[1], record[3], record[6])
                 if ok:
                     st.success(f"✅ {msg}")
                     st.rerun()
@@ -1107,24 +1257,23 @@ elif page == "📜 History Manager":
         st.success(f"Removed **{deleted}** redundant records")
 
     if st.button("📊 Show History Statistics"):
-        pipeline = [
-            {"$group": {"_id": "$field", "count": {"$sum": 1}}},
-            {"$sort": {"count": -1}}
-        ]
-        stats = list(hist.aggregate(pipeline))
+        with engine.connect() as conn:
+            stats = conn.execute(
+                text("SELECT field, COUNT(*) as count FROM history GROUP BY field ORDER BY count DESC")
+            ).fetchall()
+        
         if stats:
-            stats_df = pd.DataFrame(stats)
-            stats_df.columns = ["Field", "Change Count"]
+            stats_df = pd.DataFrame(stats, columns=["Field", "Change Count"])
             st.dataframe(stats_df, use_container_width=True, hide_index=True)
 
 
 # ─── PAGE: DB TOOLS ───────────────────────────────────────────────────────────
 elif page == "🛠️ DB Tools":
     st.title("🛠️ Database Tools")
-    st.markdown("Maintenance utilities for your 512 MB free-tier MongoDB.")
+    st.markdown("Maintenance utilities for your TiDB database.")
 
     if not db_connected():
-        st.error("Connect MongoDB first.")
+        st.error("Connect TiDB first.")
         st.stop()
 
     col1, col2 = st.columns(2)
@@ -1132,11 +1281,9 @@ elif page == "🛠️ DB Tools":
     with col1:
         st.subheader("Storage")
         try:
-            db_stats = get_employees_col().database.command("dbStats")
-            used_mb = db_stats.get("dataSize", 0) / (1024 * 1024)
-            st.metric("Used Storage", f"{used_mb:.1f} MB")
-            st.progress(min(1.0, used_mb / 512))
-            st.caption("Free tier limit: 512 MB")
+            emp_count, active_count, hist_count = get_db_stats()
+            st.metric("Total Employees", f"{emp_count:,}")
+            st.metric("History Records", f"{hist_count:,}")
         except Exception as e:
             st.error(f"Could not fetch stats: {e}")
 
@@ -1153,10 +1300,15 @@ elif page == "🛠️ DB Tools":
 
     st.divider()
     st.subheader("Recent Uploads")
-    log = get_upload_log_col()
-    if log is not None:
-        logs = list(log.find({}, {"_id": 0}).sort("upload_date", -1).limit(10))
+    engine = get_engine()
+    if engine is not None:
+        with engine.connect() as conn:
+            logs = conn.execute(
+                text("SELECT * FROM upload_log ORDER BY upload_date DESC LIMIT 10")
+            ).fetchall()
+        
         if logs:
-            st.dataframe(pd.DataFrame(logs), use_container_width=True, hide_index=True)
+            logs_df = pd.DataFrame(logs, columns=["id", "upload_date", "rows_processed", "inserted", "updated", "skipped_manual"])
+            st.dataframe(logs_df, use_container_width=True, hide_index=True)
         else:
             st.info("No uploads logged yet.")
