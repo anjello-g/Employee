@@ -108,13 +108,11 @@ def parse_date(v):
     try:
         if isinstance(v, (datetime, pd.Timestamp)):
             return v.strftime("%Y-%m-%d")
-        # Try common formats
         for fmt in ["%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%m-%d-%Y", "%d-%m-%Y", "%Y/%m/%d"]:
             try:
                 return datetime.strptime(str(v).strip(), fmt).strftime("%Y-%m-%d")
             except ValueError:
                 continue
-        # Excel serial date
         try:
             return pd.to_datetime(float(v), unit='D', origin='1899-12-30').strftime("%Y-%m-%d")
         except (ValueError, OverflowError):
@@ -158,12 +156,22 @@ def df_to_excel_bytes(df: pd.DataFrame, sheet_name="Staffing") -> bytes:
             ws.set_column(col_num, col_num, max(15, len(str(col_name)) + 2))
     return buf.getvalue()
 
-def get_doj_start(row: dict, upload_date: str) -> str:
-    """Get the start date for history: DOJ Knack if available and earlier, else upload date."""
-    doj = parse_date(row.get("DOJ Knack", ""))
-    if doj and doj <= upload_date:
-        return doj
-    return upload_date
+def get_effective_dates(row: dict, upload_date: str) -> tuple:
+    """Extract Effective From/To from row, fallback to DOJ Knack or upload date."""
+    eff_from = parse_date(row.get("Effective From", ""))
+    eff_to = parse_date(row.get("Effective To", ""))
+
+    if not eff_from:
+        doj = parse_date(row.get("DOJ Knack", ""))
+        if doj and doj <= upload_date:
+            eff_from = doj
+        else:
+            eff_from = upload_date
+
+    if not eff_to:
+        eff_to = "9999-12-31"
+
+    return eff_from, eff_to
 
 # ─── CORE LOGIC ──────────────────────────────────────────────────────────────
 BATCH_SIZE = 5000
@@ -218,8 +226,8 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
         doc["ECN"] = ecn
         existing = existing_docs.get(ecn)
 
-        # Determine baseline start date for this employee
-        baseline_start = get_doj_start(row.to_dict(), upload_date)
+        # Get effective date range from Excel or defaults
+        eff_from, eff_to = get_effective_dates(row.to_dict(), upload_date)
 
         if existing is None:
             # ── NEW EMPLOYEE ──
@@ -229,20 +237,20 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
             emp_ops.append(UpdateOne({"ECN": ecn}, {"$set": doc}, upsert=True))
             inserted += 1
 
-            # Only seed history for fields that have values (saves space)
+            # Only seed history for fields that have values
             for field, val in doc.items():
-                if field.startswith("_") or val == "":
+                if field.startswith("_") or field in ("Effective From", "Effective To") or val == "":
                     continue
                 hist_ops.append(UpdateOne(
-                    {"ECN": ecn, "field": field, "start_date": baseline_start},
+                    {"ECN": ecn, "field": field, "start_date": eff_from},
                     {"$set": {
                         "ECN": ecn,
                         "Employee": doc.get("Employee", ""),
                         "field": field,
                         "value": val,
                         "prev_value": "",
-                        "start_date": baseline_start,
-                        "end_date": "9999-12-31",
+                        "start_date": eff_from,
+                        "end_date": eff_to,
                         "source": "excel_upload",
                     }},
                     upsert=True
@@ -253,7 +261,7 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
             last_upload = existing.get("_last_upload", "2000-01-01")
 
             for field, new_val in doc.items():
-                if field.startswith("_"):
+                if field.startswith("_") or field in ("Effective From", "Effective To"):
                     continue
                 old_val = existing.get(field, "")
 
@@ -264,21 +272,23 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
                         skipped_manual += 1
                         continue
 
+                    # Close previous open history
                     hist_ops.append(UpdateOne(
                         {"ECN": ecn, "field": field, "end_date": "9999-12-31"},
                         {"$set": {"end_date": upload_date}}
                     ))
 
+                    # Insert new history with effective dates from Excel
                     hist_ops.append(UpdateOne(
-                        {"ECN": ecn, "field": field, "start_date": upload_date},
+                        {"ECN": ecn, "field": field, "start_date": eff_from},
                         {"$set": {
                             "ECN": ecn,
                             "Employee": doc.get("Employee", existing.get("Employee", "")),
                             "field": field,
                             "value": new_val,
                             "prev_value": old_val,
-                            "start_date": upload_date,
-                            "end_date": "9999-12-31",
+                            "start_date": eff_from,
+                            "end_date": eff_to,
                             "source": "excel_upload",
                         }},
                         upsert=True
@@ -286,7 +296,7 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
                     changed = True
 
             if changed:
-                update_doc = {k: v for k, v in doc.items() if not k.startswith("_")}
+                update_doc = {k: v for k, v in doc.items() if not k.startswith("_") and k not in ("Effective From", "Effective To")}
                 update_doc["_updated_at"] = upload_date
                 update_doc["_last_upload"] = upload_date
                 emp_ops.append(UpdateOne({"ECN": ecn}, {"$set": update_doc}))
@@ -366,7 +376,7 @@ def get_employees_at_date(query_date: str) -> pd.DataFrame:
     return df
 
 
-def record_manual_edit(ecn: str, field: str, new_value: str, start_date: str):
+def record_manual_edit(ecn: str, field: str, new_value: str, start_date: str, end_date: str = "9999-12-31"):
     col = get_employees_col()
     hist = get_history_col()
     if col is None or hist is None:
@@ -379,9 +389,15 @@ def record_manual_edit(ecn: str, field: str, new_value: str, start_date: str):
 
         old_value = existing.get(field, "")
 
-        # Close any open history entry that overlaps
+        # Close any open history entry that overlaps with our new range
         hist.update_many(
             {"ECN": ecn, "field": field, "end_date": "9999-12-31", "start_date": {"$lte": start_date}},
+            {"$set": {"end_date": start_date}}
+        )
+
+        # Also close any entries that start within our new range
+        hist.update_many(
+            {"ECN": ecn, "field": field, "start_date": {"$gt": start_date, "$lt": end_date}},
             {"$set": {"end_date": start_date}}
         )
 
@@ -395,17 +411,18 @@ def record_manual_edit(ecn: str, field: str, new_value: str, start_date: str):
                 "value": new_value,
                 "prev_value": old_value,
                 "start_date": start_date,
-                "end_date": "9999-12-31",
+                "end_date": end_date,
                 "source": "manual_edit",
             }},
             upsert=True
         )
 
-        # Update current record
-        col.update_one(
-            {"ECN": ecn},
-            {"$set": {field: new_value, "_updated_at": start_date}}
-        )
+        # Update current record only if this is the ongoing version
+        if end_date == "9999-12-31":
+            col.update_one(
+                {"ECN": ecn},
+                {"$set": {field: new_value, "_updated_at": start_date}}
+            )
         return True, "Saved"
 
     except DuplicateKeyError as e:
@@ -472,11 +489,12 @@ if page == "📤 Upload / Sync":
         st.markdown("**Instructions**")
         st.markdown("""
         - **Required column:** `ECN` (unique employee ID)
-        - **Any other columns are accepted** — the app adapts automatically
-        - **First upload:** populates the DB (baseline history = DOJ Knack date or upload date)
+        - **Optional date columns:** `Effective From`, `Effective To`
+        - **Recommended:** `DOJ Knack`, `Date of Separation`
+        - **Any other columns** are accepted — the app adapts automatically
+        - **First upload:** populates the DB (baseline history = DOJ Knack or upload date)
         - **Subsequent uploads:** updates only changed records
         - **In-app edits are protected:** uploads will NOT overwrite fields manually edited after the last upload
-        - **Duplicate ECN rows?** The app keeps the *last* occurrence automatically
         """)
 
     if uploaded:
@@ -488,7 +506,7 @@ if page == "📤 Upload / Sync":
             st.stop()
 
         st.success(f"✅ File loaded — **{len(df):,} rows**, **{len(df.columns)} columns**")
-        st.caption(f"Columns detected: {', '.join(df.columns[:10])}{'...' if len(df.columns) > 10 else ''}")
+        st.caption(f"Columns detected: {', '.join(df.columns[:12])}{'...' if len(df.columns) > 12 else ''}")
 
         with st.expander("Preview (first 10 rows)"):
             st.dataframe(df.head(10), use_container_width=True)
@@ -544,8 +562,9 @@ elif page == "👤 Employee Editor":
     st.info("""
     **How manual edits work:**
     - Click any row in the table below to open the edit dialog
-    - Change any field and set an **Effective Date**
-    - The change is recorded in history starting from that date
+    - Set **Effective From** and optionally **Effective To**
+    - Leave **Effective To** blank for ongoing changes
+    - The change is recorded in history for that date range
     - **Future Excel uploads will skip this field** if they occur after your manual edit date
     """)
 
@@ -575,7 +594,6 @@ elif page == "👤 Employee Editor":
     st.markdown(f"**{len(docs)} employees found** (max 200 shown)")
     st.caption("👆 Click any row to edit that employee")
 
-    # Use st.dataframe with on_select for row clicking
     selected_rows = st.dataframe(
         df_list[display_cols],
         use_container_width=True,
@@ -584,7 +602,6 @@ elif page == "👤 Employee Editor":
         selection_mode="single-row",
     )
 
-    # Modal dialog for editing
     @st.dialog("✏️ Edit Employee", width="large")
     def edit_employee_modal(emp):
         ecn = emp["ECN"]
@@ -593,10 +610,20 @@ elif page == "👤 Employee Editor":
         tab1, tab2 = st.tabs(["Edit Fields", "Field History"])
 
         with tab1:
-            st.markdown("**Effective Date** — the date from which this change applies:")
-            eff_date = st.date_input("Effective Start Date", value=date.today(), key=f"eff_date_{ecn}")
-            eff_date_str = eff_date.isoformat()
+            col1, col2 = st.columns(2)
+            with col1:
+                eff_from = st.date_input("Effective From", value=date.today(), key=f"eff_from_{ecn}")
+            with col2:
+                eff_to = st.date_input("Effective To (leave blank for ongoing)", value=None, key=f"eff_to_{ecn}")
 
+            eff_from_str = eff_from.isoformat()
+            eff_to_str = eff_to.isoformat() if eff_to else "9999-12-31"
+
+            if eff_to and eff_to <= eff_from:
+                st.error("Effective To must be after Effective From")
+                return
+
+            st.markdown("**Fields** (all changes are tracked with effective dates)")
             all_fields = [k for k in emp.keys() if not k.startswith("_")]
             preferred_first = ["Billable/Buffer", "Active/Inactive", "Client", "Sub-Process",
                                "Supervisor", "Role", "Manager", "Location", "Overall Location",
@@ -605,7 +632,6 @@ elif page == "👤 Employee Editor":
             ordered_fields = [f for f in preferred_first if f in all_fields]
             ordered_fields += [f for f in all_fields if f not in ordered_fields]
 
-            st.markdown("**Fields** (all changes are tracked with effective dates)")
             edit_vals = {}
             cols = st.columns(3)
             for i, field in enumerate(ordered_fields):
@@ -619,7 +645,7 @@ elif page == "👤 Employee Editor":
                 errors = []
                 for field, new_val in edit_vals.items():
                     if new_val != emp.get(field, ""):
-                        ok, msg = record_manual_edit(ecn, field, new_val, eff_date_str)
+                        ok, msg = record_manual_edit(ecn, field, new_val, eff_from_str, eff_to_str)
                         if ok:
                             saved += 1
                         else:
@@ -629,7 +655,7 @@ elif page == "👤 Employee Editor":
                     for e in errors:
                         st.error(e)
                 if saved:
-                    st.success(f"✅ {saved} field(s) updated, effective {eff_date_str}")
+                    st.success(f"✅ {saved} field(s) updated, effective {eff_from_str} to {eff_to_str if eff_to_str != '9999-12-31' else 'ongoing'}")
                     st.rerun()
                 elif not errors:
                     st.info("No changes detected.")
@@ -710,7 +736,7 @@ elif page == "📅 Date Snapshot":
 # ─── PAGE: EXPORT ─────────────────────────────────────────────────────────────
 elif page == "📊 Export Data":
     st.title("📊 Export Data")
-    st.markdown("Export staffing data for any time range.")
+    st.markdown("Export staffing data for any time range. All dates in one sheet with `Date Exported` column.")
 
     if not db_connected():
         st.error("Connect MongoDB first.")
@@ -765,67 +791,99 @@ elif page == "📊 Export Data":
 
     st.divider()
     export_mode = st.radio("Export Mode", [
-        "End-of-period snapshot",
-        "Daily snapshots (one sheet per day)",
-    ], help="End-of-period: single snapshot at the last day. Daily: one tab per day in Excel.")
+        "Single sheet (all dates appended with Date Exported column)",
+        "One sheet per day",
+    ], help="Single sheet: all dates in one tab, filterable by Date Exported. One sheet per day: separate tabs.")
 
     filter_active = st.checkbox("Active employees only", value=False)
     filter_client2 = st.text_input("Filter by Client (optional)", key="exp_client")
 
     if st.button("📥 Generate Export", type="primary"):
-        if export_mode == "End-of-period snapshot":
-            with st.spinner(f"Generating snapshot at {end_date}..."):
-                df = get_employees_at_date(end_date)
-                if filter_active and "Active/Inactive" in df.columns:
-                    df = df[df["Active/Inactive"] == "Active"]
-                if filter_client2 and "Client" in df.columns:
-                    df = df[df["Client"].str.contains(filter_client2, case=False, na=False)]
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        days = (end_dt - start_dt).days + 1
 
-            st.success(f"✅ {len(df):,} employees as of {end_date}")
-            excel_bytes = df_to_excel_bytes(df, sheet_name="Export")
+        if days > 366:
+            st.warning("Export limited to 366 days. Please narrow your range.")
+            st.stop()
+
+        if export_mode == "Single sheet (all dates appended with Date Exported column)":
+            # Build single DataFrame with all dates
+            all_dfs = []
+            progress_bar = st.progress(0, text="Building export...")
+
+            for i in range(days):
+                d = (start_dt + timedelta(days=i)).date().isoformat()
+                df_day = get_employees_at_date(d)
+                if df_day.empty:
+                    continue
+                if filter_active and "Active/Inactive" in df_day.columns:
+                    df_day = df_day[df_day["Active/Inactive"] == "Active"]
+                if filter_client2 and "Client" in df_day.columns:
+                    df_day = df_day[df_day["Client"].str.contains(filter_client2, case=False, na=False)]
+
+                if not df_day.empty:
+                    df_day["Date Exported"] = d
+                    all_dfs.append(df_day)
+
+                progress_bar.progress((i + 1) / days, text=f"Processing {d}...")
+
+            if not all_dfs:
+                st.warning("No data found for the selected range.")
+                st.stop()
+
+            # Combine all dates into one sheet
+            combined_df = pd.concat(all_dfs, ignore_index=True)
+
+            # Reorder columns: Date Exported first
+            cols = ["Date Exported"] + [c for c in combined_df.columns if c != "Date Exported"]
+            combined_df = combined_df[cols]
+
+            st.success(f"✅ {len(combined_df):,} rows across {len(all_dfs)} days")
+            st.dataframe(combined_df.head(20), use_container_width=True)
+
+            excel_bytes = df_to_excel_bytes(combined_df, sheet_name="Staffing Export")
             st.download_button(
-                f"⬇️ Download {exp_type} Export",
+                f"⬇️ Download {exp_type} Export (Single Sheet)",
                 data=excel_bytes,
-                file_name=f"staffing_{label}.xlsx",
+                file_name=f"staffing_{label}_single_sheet.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
         else:
-            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-            days = (end_dt - start_dt).days + 1
-
+            # One sheet per day (original behavior)
             if days > 31:
-                st.warning("Daily snapshot mode is limited to 31 days. Please narrow your range.")
-            else:
-                buf = io.BytesIO()
-                with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-                    wb = writer.book
-                    header_fmt = wb.add_format({"bold": True, "bg_color": "#1f4e79", "font_color": "white"})
+                st.warning("One sheet per day mode is limited to 31 days. Please narrow your range or use Single Sheet mode.")
+                st.stop()
 
-                    progress_bar = st.progress(0, text="Building sheets...")
-                    for i in range(days):
-                        d = (start_dt + timedelta(days=i)).date().isoformat()
-                        df_day = get_employees_at_date(d)
-                        if filter_active and "Active/Inactive" in df_day.columns:
-                            df_day = df_day[df_day["Active/Inactive"] == "Active"]
-                        if filter_client2 and "Client" in df_day.columns:
-                            df_day = df_day[df_day["Client"].str.contains(filter_client2, case=False, na=False)]
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+                wb = writer.book
+                header_fmt = wb.add_format({"bold": True, "bg_color": "#1f4e79", "font_color": "white"})
 
-                        sheet_name = d.replace("-", "")[-6:]
-                        df_day.to_excel(writer, index=False, sheet_name=sheet_name)
-                        ws = writer.sheets[sheet_name]
-                        for col_num, col_name in enumerate(df_day.columns):
-                            ws.write(0, col_num, col_name, header_fmt)
-                        progress_bar.progress((i + 1) / days, text=f"Building {d}...")
+                progress_bar = st.progress(0, text="Building sheets...")
+                for i in range(days):
+                    d = (start_dt + timedelta(days=i)).date().isoformat()
+                    df_day = get_employees_at_date(d)
+                    if filter_active and "Active/Inactive" in df_day.columns:
+                        df_day = df_day[df_day["Active/Inactive"] == "Active"]
+                    if filter_client2 and "Client" in df_day.columns:
+                        df_day = df_day[df_day["Client"].str.contains(filter_client2, case=False, na=False)]
 
-                st.success(f"✅ {days} daily sheets generated!")
-                st.download_button(
-                    "⬇️ Download Daily Export",
-                    data=buf.getvalue(),
-                    file_name=f"staffing_{label}_daily.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+                    sheet_name = d.replace("-", "")[-6:]
+                    df_day.to_excel(writer, index=False, sheet_name=sheet_name)
+                    ws = writer.sheets[sheet_name]
+                    for col_num, col_name in enumerate(df_day.columns):
+                        ws.write(0, col_num, col_name, header_fmt)
+                    progress_bar.progress((i + 1) / days, text=f"Building {d}...")
+
+            st.success(f"✅ {days} daily sheets generated!")
+            st.download_button(
+                "⬇️ Download Daily Export",
+                data=buf.getvalue(),
+                file_name=f"staffing_{label}_daily.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
 
 # ─── PAGE: DB TOOLS ───────────────────────────────────────────────────────────
