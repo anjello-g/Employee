@@ -22,7 +22,6 @@ st.set_page_config(
 
 # ─── MONGODB CONNECTION ──────────────────────────────────────────────────────
 def parse_and_escape_uri(uri: str) -> str:
-    """Escape username/password in MongoDB URI to handle special characters."""
     if not uri or not uri.startswith("mongodb"):
         return uri
     try:
@@ -43,7 +42,6 @@ def parse_and_escape_uri(uri: str) -> str:
 
 @st.cache_resource(show_spinner=False)
 def get_db():
-    # Priority: Streamlit secrets → env var
     uri = ""
     try:
         uri = st.secrets.get("MONGO_URI", "")
@@ -134,20 +132,36 @@ def df_to_excel_bytes(df: pd.DataFrame, sheet_name="Staffing") -> bytes:
     return buf.getvalue()
 
 # ─── CORE LOGIC ──────────────────────────────────────────────────────────────
-def upsert_employees(df: pd.DataFrame, upload_date: str):
+BATCH_SIZE = 500
+
+def flush_batches(col, hist, emp_ops, hist_ops):
+    """Write pending ops to DB in batches."""
+    if emp_ops:
+        try:
+            col.bulk_write(emp_ops, ordered=False)
+        except BulkWriteError:
+            pass
+    if hist_ops:
+        try:
+            hist.bulk_write(hist_ops, ordered=False)
+        except BulkWriteError:
+            pass
+
+def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
     col = get_employees_col()
     hist = get_history_col()
     log = get_upload_log_col()
     if col is None or hist is None:
         return 0, 0, "Database not connected"
 
-    ops = []
+    emp_ops = []
     hist_ops = []
     inserted = 0
     updated = 0
     skipped_manual = 0
+    total_rows = len(df)
 
-    for _, row in df.iterrows():
+    for idx, (_, row) in enumerate(df.iterrows()):
         ecn = str(row.get("ECN", "")).strip()
         if not ecn or ecn.lower() == "nan":
             continue
@@ -161,7 +175,7 @@ def upsert_employees(df: pd.DataFrame, upload_date: str):
             doc["_created_at"] = upload_date
             doc["_updated_at"] = upload_date
             doc["_last_upload"] = upload_date
-            ops.append(UpdateOne({"ECN": ecn}, {"$set": doc}, upsert=True))
+            emp_ops.append(UpdateOne({"ECN": ecn}, {"$set": doc}, upsert=True))
             inserted += 1
 
             for field, val in doc.items():
@@ -225,27 +239,28 @@ def upsert_employees(df: pd.DataFrame, upload_date: str):
                 update_doc = {k: v for k, v in doc.items() if not k.startswith("_")}
                 update_doc["_updated_at"] = upload_date
                 update_doc["_last_upload"] = upload_date
-                ops.append(UpdateOne({"ECN": ecn}, {"$set": update_doc}))
+                emp_ops.append(UpdateOne({"ECN": ecn}, {"$set": update_doc}))
                 updated += 1
             else:
-                ops.append(UpdateOne({"ECN": ecn}, {"$set": {"_last_upload": upload_date}}))
+                emp_ops.append(UpdateOne({"ECN": ecn}, {"$set": {"_last_upload": upload_date}}))
 
-    if ops:
-        try:
-            col.bulk_write(ops, ordered=False)
-        except BulkWriteError as bwe:
-            st.warning(f"Some writes failed: {bwe.details}")
+        # Flush every BATCH_SIZE to keep memory low and show progress
+        if len(emp_ops) >= BATCH_SIZE or len(hist_ops) >= BATCH_SIZE:
+            flush_batches(col, hist, emp_ops, hist_ops)
+            emp_ops = []
+            hist_ops = []
+            if progress_bar is not None:
+                progress_bar.progress(min(0.99, (idx + 1) / total_rows), text=f"Processed {idx + 1}/{total_rows}...")
 
-    if hist_ops:
-        try:
-            hist.bulk_write(hist_ops, ordered=False)
-        except BulkWriteError as bwe:
-            st.warning(f"Some history writes failed: {bwe.details}")
+    # Final flush
+    flush_batches(col, hist, emp_ops, hist_ops)
+    if progress_bar is not None:
+        progress_bar.progress(1.0, text="Finalizing...")
 
     if log is not None:
         log.insert_one({
             "upload_date": upload_date,
-            "rows_processed": len(df),
+            "rows_processed": total_rows,
             "inserted": inserted,
             "updated": updated,
             "skipped_manual": skipped_manual,
@@ -350,7 +365,6 @@ with st.sidebar:
     st.title("Staffing App")
     st.divider()
 
-    # Connection status only — no URI input
     if db_connected():
         st.success("✅ MongoDB Connected")
     else:
@@ -405,11 +419,10 @@ if page == "📤 Upload / Sync":
 
         if st.button("🚀 Sync to Database", type="primary"):
             today_str = date.today().isoformat()
-            progress = st.progress(0, text="Syncing...")
+            progress = st.progress(0, text="Preparing...")
 
             with st.spinner("Writing to MongoDB..."):
-                inserted, updated, err = upsert_employees(df, today_str)
-                progress.progress(100, text="Done!")
+                inserted, updated, err = upsert_employees(df, today_str, progress_bar=progress)
 
             if err:
                 st.error(err)
@@ -715,7 +728,7 @@ elif page == "📊 Export Data":
                     "⬇️ Download Daily Export",
                     data=buf.getvalue(),
                     file_name=f"staffing_{label}_daily.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    mime="application/vnd.openxmlformats.officedocument.spreadsheetml.sheet",
                 )
 
 
