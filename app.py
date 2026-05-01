@@ -1134,7 +1134,7 @@ def get_employees_at_date(query_date: str) -> pd.DataFrame:
             df = df.drop(columns=['__sep'])
         with engine.connect() as conn:
             result = conn.execute(text(
-                'SELECT ecn, field, value FROM history WHERE start_date<=:d AND end_date>:d'
+                "SELECT ecn, field, value FROM history WHERE start_date<=:d AND end_date>=:d ORDER BY start_date DESC"
             ), {'d': query_date}).fetchall()
         if result:
             overrides = {}
@@ -1221,11 +1221,13 @@ def delete_history_record(record_id: int):
             if not record:
                 return False, 'Record not found'
             ecn, field, start_date = record['ecn'], record['field'], record['start_date']
+            # Normalize start_date so it matches the end_date stored by record_manual_edit
+            norm_start = parse_date(start_date) or start_date
             conn.execute(text('DELETE FROM history WHERE id=:id'), {'id': record_id})
             prev = conn.execute(text(
                 'SELECT * FROM history WHERE ecn=:ecn AND field=:field AND end_date=:start '
                 'ORDER BY start_date DESC LIMIT 1'
-            ), {'ecn': ecn, 'field': field, 'start': start_date}).mappings().fetchone()
+            ), {'ecn': ecn, 'field': field, 'start': norm_start}).mappings().fetchone()
             emp = get_employee(engine, ecn)
             if prev:
                 conn.execute(text(
@@ -1251,6 +1253,9 @@ def update_history_record(record_id: int, new_value: str, new_start: str, new_en
     if engine is None:
         return False, 'Database not connected'
     try:
+        # Normalize dates to ISO format so lookups stay consistent
+        norm_start = parse_date(new_start) or new_start
+        norm_end   = parse_date(new_end)   or new_end
         with engine.connect() as conn:
             record = conn.execute(
                 text('SELECT ecn, field, end_date FROM history WHERE id=:id'), {'id': record_id}
@@ -1259,8 +1264,8 @@ def update_history_record(record_id: int, new_value: str, new_start: str, new_en
                 return False, 'Record not found'
             conn.execute(text(
                 'UPDATE history SET value=:val, start_date=:start, end_date=:end WHERE id=:id'
-            ), {'val': new_value, 'start': new_start, 'end': new_end, 'id': record_id})
-            if record['end_date'] == '9999-12-31' or new_end == '9999-12-31':
+            ), {'val': new_value, 'start': norm_start, 'end': norm_end, 'id': record_id})
+            if record['end_date'] == '9999-12-31' or norm_end == '9999-12-31':
                 emp = get_employee(engine, record['ecn'])
                 if emp:
                     emp[record['field']] = new_value
@@ -1825,7 +1830,7 @@ elif page == 'export':
                 ovr = {}
                 for ecn in df_day['ECN'].unique():
                     for p in hist_lookup.get((ecn, field), []):
-                        if p['start'] <= d_ts < p['end']:
+                        if p['start'] <= d_ts <= p['end']:
                             ovr[ecn] = p['value']; break
                 if ovr:
                     df_day[field] = df_day['ECN'].map(ovr).fillna(df_day[field])
