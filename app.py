@@ -711,7 +711,7 @@ def safe_str(v):
     if isinstance(v, float) and np.isnan(v):
         return ''
     if isinstance(v, (datetime, pd.Timestamp)):
-        return v.strftime('%Y-%m-%d')
+        return v.strftime('%m/%d/%Y')
     return str(v).strip()
 
 def parse_date(v):
@@ -719,18 +719,20 @@ def parse_date(v):
         return None
     try:
         if isinstance(v, (datetime, pd.Timestamp)):
-            return v.strftime('%Y-%m-%d')
+            return v.strftime('%m/%d/%Y')
         s = str(v).strip()
-        # Strip time component if present (e.g. "2026-03-15 00:00:00")
+        # Strip time component if present (e.g. "2026-03-15 00:00:00" or "2026-03-15T00:00:00")
         if ' ' in s:
             s = s.split(' ')[0]
+        if 'T' in s:
+            s = s.split('T')[0]
         for fmt in ('%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y', '%m-%d-%Y', '%d-%m-%Y', '%Y/%m/%d'):
             try:
-                return datetime.strptime(s, fmt).strftime('%Y-%m-%d')
+                return datetime.strptime(s, fmt).strftime('%m/%d/%Y')
             except ValueError:
                 continue
         try:
-            return pd.to_datetime(float(s), unit='D', origin='1899-12-30').strftime('%Y-%m-%d')
+            return pd.to_datetime(float(s), unit='D', origin='1899-12-30').strftime('%m/%d/%Y')
         except (ValueError, OverflowError):
             pass
     except Exception:
@@ -755,21 +757,27 @@ def reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
     remaining = [c for c in df.columns if c not in ordered]
     return df[ordered + remaining]
 
-def calculate_aging_bucket(doj_str, sep_str, fallback_date_str=None) -> str:
-    doj = parse_date(doj_str)
-    if not doj:
-        return ''
-    sep = parse_date(sep_str)
-    if sep:
-        end_dt = datetime.strptime(sep, '%Y-%m-%d').date()
-    elif fallback_date_str:
+def _parse_to_date(dt_str):
+    """Parse a date string (MM/DD/YYYY or YYYY-MM-DD) to a date object."""
+    if not dt_str:
+        return None
+    s = str(dt_str).strip()
+    for fmt in ('%m/%d/%Y', '%Y-%m-%d', '%m-%d-%Y', '%d/%m/%Y'):
         try:
-            end_dt = datetime.strptime(str(fallback_date_str), '%Y-%m-%d').date()
-        except Exception:
-            end_dt = date.today()
-    else:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+def calculate_aging_bucket(doj_str, sep_str, fallback_date_str=None) -> str:
+    start_dt = _parse_to_date(doj_str)
+    if not start_dt:
+        return ''
+    end_dt = _parse_to_date(sep_str)
+    if not end_dt:
+        end_dt = _parse_to_date(fallback_date_str)
+    if not end_dt:
         end_dt = date.today()
-    start_dt = datetime.strptime(doj, '%Y-%m-%d').date()
     delta = (end_dt - start_dt).days
     if delta < 0:   return ''
     if delta <= 30:  return '0-30'
@@ -893,7 +901,7 @@ def get_effective_dates(row: dict, upload_date: str) -> tuple:
         doj = parse_date(row.get('DOJ Knack', ''))
         eff_from = doj if (doj and doj <= upload_date) else upload_date
     if not eff_to:
-        eff_to = '9999-12-31'
+        eff_to = '12/31/9999'
     return eff_from, eff_to
 
 BATCH_SIZE = 500
@@ -1078,7 +1086,7 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
                 close_targets = [h for h in history_records if h.get('_close_prev')]
                 for h in close_targets:
                     conn.execute(text(
-                        "UPDATE history SET end_date=:upload WHERE ecn=:ecn AND field=:field AND end_date='9999-12-31' AND start_date<:start"
+                        "UPDATE history SET end_date=:upload WHERE ecn=:ecn AND field=:field AND end_date='12/31/9999' AND start_date<:start"
                     ), {'upload': upload_date, 'ecn': h['_ecn'], 'field': h['_field'], 'start': h['start_date']})
 
                 hist_clean = [{k: v for k, v in h.items() if not k.startswith('_')} for h in history_records]
@@ -1115,48 +1123,8 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
         import traceback
         return 0, 0, f"{str(e)}\n{traceback.format_exc()}"
         
-@st.cache_data(ttl=60, show_spinner=False)
-def get_employees_at_date(query_date: str) -> pd.DataFrame:
-    engine = get_engine()
-    if engine is None:
-        return pd.DataFrame()
-    try:
-        df = get_all_employees_df()
-        if df.empty:
-            return df
-        if 'DOJ Knack' in df.columns:
-            df['__doj'] = df['DOJ Knack'].apply(parse_date)
-            df = df[df['__doj'].isna() | (df['__doj'] <= query_date)]
-            df = df.drop(columns=['__doj'])
-        if 'Date of Separation' in df.columns:
-            df['__sep'] = df['Date of Separation'].apply(parse_date)
-            df = df[df['__sep'].isna() | (df['__sep'] >= query_date)]
-            df = df.drop(columns=['__sep'])
-        with engine.connect() as conn:
-            result = conn.execute(text(
-                "SELECT ecn, field, value FROM history WHERE start_date<=:d AND end_date>=:d ORDER BY start_date DESC"
-            ), {'d': query_date}).fetchall()
-        if result:
-            overrides = {}
-            for ecn, field, value in result:
-                overrides.setdefault((ecn, field), value)
-            for (ecn, field), val in overrides.items():
-                if field in df.columns:
-                    df.loc[df['ECN'] == ecn, field] = val
-        ref = datetime.strptime(query_date, '%Y-%m-%d').date()
-        df = filter_accepted_columns(df)
-        # Auto-generate Date Exported based on the snapshot date
-        df['Date Exported'] = query_date
-        df = apply_aging_bucket(df, ref_date=ref, use_date_exported=True)
-        df = apply_active_nulls(df)
-        df = reorder_columns(df)
-        internal = [c for c in df.columns if c.startswith('_')]
-        return df.drop(columns=internal, errors='ignore')
-    except Exception as e:
-        st.error(f'Snapshot error: {e}')
-        return pd.DataFrame()
 
-def record_manual_edit(ecn: str, field: str, new_value: str, start_date: str, end_date: str = '9999-12-31'):
+def record_manual_edit(ecn: str, field: str, new_value: str, start_date: str, end_date: str = '12/31/9999'):
     engine = get_engine()
     if engine is None:
         return False, 'Database not connected'
@@ -1165,33 +1133,35 @@ def record_manual_edit(ecn: str, field: str, new_value: str, start_date: str, en
         if not existing:
             return False, 'Employee not found'
         old_value = existing.get(field, '')
+        # Normalize dates to MM/DD/YYYY for storage consistency
+        norm_start = parse_date(start_date) or start_date
+        norm_end   = parse_date(end_date)   or end_date
         with engine.connect() as conn:
             conn.execute(text(
                 "UPDATE history SET end_date=:start WHERE ecn=:ecn AND field=:field "
-                "AND end_date='9999-12-31' AND start_date<=:start"
-            ), {'start': start_date, 'ecn': ecn, 'field': field})
+                "AND end_date='12/31/9999' AND start_date<=:start"
+            ), {'start': norm_start, 'ecn': ecn, 'field': field})
             conn.execute(text(
                 'UPDATE history SET end_date=:start WHERE ecn=:ecn AND field=:field '
                 'AND start_date>:start AND start_date<:end'
-            ), {'start': start_date, 'end': end_date, 'ecn': ecn, 'field': field})
+            ), {'start': norm_start, 'end': norm_end, 'ecn': ecn, 'field': field})
             conn.execute(text(
                 "INSERT INTO history (ecn, employee_name, field, value, prev_value, start_date, end_date, source) "
                 "VALUES (:ecn, :emp, :field, :val, :prev, :start, :end, 'manual_edit') "
                 "ON DUPLICATE KEY UPDATE value=VALUES(value), prev_value=VALUES(prev_value), end_date=VALUES(end_date)"
             ), {'ecn': ecn, 'emp': existing.get('Employee', ''), 'field': field,
-                'val': new_value, 'prev': old_value, 'start': start_date, 'end': end_date})
-            if end_date == '9999-12-31':
+                'val': new_value, 'prev': old_value, 'start': norm_start, 'end': norm_end})
+            if norm_end == '12/31/9999':
                 existing[field] = new_value
-                existing['_updated_at'] = start_date
+                existing['_updated_at'] = norm_start
                 conn.execute(text('UPDATE employees SET data=:data, updated_at=:upd WHERE ecn=:ecn'),
-                             {'ecn': ecn, 'data': json.dumps(existing), 'upd': start_date})
+                             {'ecn': ecn, 'data': json.dumps(existing), 'upd': norm_start})
             conn.commit()
         st.cache_data.clear()
         return True, 'Saved'
     except Exception as e:
         return False, f'Error: {str(e)[:120]}'
 
-@st.cache_data(ttl=60, show_spinner=False)
 def get_employee_history(ecn: str) -> pd.DataFrame:
     engine = get_engine()
     if engine is None:
@@ -1231,7 +1201,7 @@ def delete_history_record(record_id: int):
             emp = get_employee(engine, ecn)
             if prev:
                 conn.execute(text(
-                    "UPDATE history SET end_date='9999-12-31' WHERE ecn=:ecn AND field=:field AND start_date=:ps"
+                    "UPDATE history SET end_date='12/31/9999' WHERE ecn=:ecn AND field=:field AND start_date=:ps"
                 ), {'ecn': ecn, 'field': field, 'ps': prev['start_date']})
                 if emp:
                     emp[field] = prev['value']
@@ -1265,7 +1235,7 @@ def update_history_record(record_id: int, new_value: str, new_start: str, new_en
             conn.execute(text(
                 'UPDATE history SET value=:val, start_date=:start, end_date=:end WHERE id=:id'
             ), {'val': new_value, 'start': norm_start, 'end': norm_end, 'id': record_id})
-            if record['end_date'] == '9999-12-31' or norm_end == '9999-12-31':
+            if record['end_date'] == '12/31/9999' or norm_end == '12/31/9999':
                 emp = get_employee(engine, record['ecn'])
                 if emp:
                     emp[record['field']] = new_value
@@ -1310,7 +1280,6 @@ def get_db_stats():
 NAV = {
     'upload':    ('📤', 'Upload & Sync'),
     'employees': ('👤', 'Employees'),
-    'snapshot':  ('📅', 'Snapshot'),
     'export':    ('📊', 'Export'),
     'history':   ('📜', 'History'),
     'dbtools':   ('🛠️', 'DB Tools'),
@@ -1574,8 +1543,8 @@ elif page == 'employees':
             c1, c2 = st.columns(2)
             eff_from = c1.date_input('Effective From', value=date.today(), key=f'sef_{ecn}')
             eff_to   = c2.date_input('Effective To (blank = ongoing)', value=None, key=f'set_{ecn}')
-            eff_from_s = eff_from.isoformat()
-            eff_to_s   = eff_to.isoformat() if eff_to else '9999-12-31'
+            eff_from_s = eff_from.strftime('%m/%d/%Y')
+            eff_to_s   = eff_to.strftime('%m/%d/%Y') if eff_to else '12/31/9999'
             if eff_to and eff_to <= eff_from:
                 st.error('Effective To must be after Effective From'); return
 
@@ -1623,8 +1592,8 @@ elif page == 'employees':
                 c1, c2 = st.columns(2)
                 eff_from = c1.date_input('Effective From', value=date.today(), key='bef')
                 eff_to   = c2.date_input('Effective To (blank = ongoing)', value=None, key='bet')
-                eff_from_s = eff_from.isoformat()
-                eff_to_s   = eff_to.isoformat() if eff_to else '9999-12-31'
+                eff_from_s = eff_from.strftime('%m/%d/%Y')
+                eff_to_s   = eff_to.strftime('%m/%d/%Y') if eff_to else '12/31/9999'
                 if eff_to and eff_to <= eff_from:
                     st.error('Effective To must be after Effective From'); return
 
@@ -1678,55 +1647,6 @@ elif page == 'employees':
             _bulk_edit()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PAGE: SNAPSHOT
-# ═══════════════════════════════════════════════════════════════════════════════
-elif page == 'snapshot':
-    page_header('Historical Snapshot', 'View staffing as it appeared on any past date')
-    if not db_connected():
-        st.error('Connect TiDB first.'); st.stop()
-
-    snap_date = st.date_input('Snapshot date', value=date.today())
-    snap_str  = snap_date.isoformat()
-
-    sc1, sc2, sc3 = st.columns(3)
-    filter_cl2  = sc1.text_input('Filter by Client', placeholder='(optional)')
-    filter_bb2  = sc2.selectbox('Billable/Buffer', ['All','Billable','Buffer','Support','Training','Excluded'])
-    filter_st2  = sc3.selectbox('Status', ['All','Active','Inactive','LOA','Maternity','Suspended'])
-
-    if st.button('📸  Load Snapshot', type='primary'):
-        with st.spinner(f'Building snapshot for {snap_str}…'):
-            df = get_employees_at_date(snap_str)
-        if df.empty:
-            st.warning('No data found for this date.')
-        else:
-            if filter_cl2 and 'Client' in df.columns:
-                df = df[df['Client'].str.contains(filter_cl2, case=False, na=False)]
-            if filter_bb2 != 'All' and 'Billable/Buffer' in df.columns:
-                df = df[df['Billable/Buffer'] == filter_bb2]
-            if filter_st2 != 'All' and 'Active/Inactive' in df.columns:
-                df = df[df['Active/Inactive'] == filter_st2]
-
-            st.success(f'**{snap_str}** — **{len(df):,} employees**')
-
-            mc1, mc2, mc3, mc4 = st.columns(4)
-            if 'Billable/Buffer' in df.columns:
-                mc1.markdown(stat_card('Billable', len(df[df['Billable/Buffer']=='Billable']), '💰'), unsafe_allow_html=True)
-                mc2.markdown(stat_card('Buffer',   len(df[df['Billable/Buffer']=='Buffer']),   '🔄'), unsafe_allow_html=True)
-                mc3.markdown(stat_card('Support',  len(df[df['Billable/Buffer']=='Support']),  '🛟'), unsafe_allow_html=True)
-            if 'Active/Inactive' in df.columns:
-                mc4.markdown(stat_card('Active', len(df[df['Active/Inactive']=='Active']), '✅', '#22c55e'), unsafe_allow_html=True)
-
-            st.markdown('<div style="height:0.75rem;"></div>', unsafe_allow_html=True)
-            dcols = [c for c in DISPLAY_ORDER if c in df.columns]
-            st.dataframe(df[dcols], use_container_width=True, hide_index=True)
-            st.download_button(
-                f'⬇️  Download Snapshot ({snap_str})',
-                data=df_to_excel_bytes(df, sheet_name=f'Snapshot_{snap_str}'),
-                file_name=f'staffing_snapshot_{snap_str}.xlsx',
-                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            )
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # PAGE: EXPORT
 # ═══════════════════════════════════════════════════════════════════════════════
 elif page == 'export':
@@ -1739,12 +1659,12 @@ elif page == 'export':
 
     if exp_type == 'Daily':
         exp_date = st.date_input('Date', value=today)
-        dates = [exp_date.isoformat()]; label = f'daily_{exp_date}'
+        dates = [exp_date.isoformat()]; label = f'daily_{exp_date.strftime("%m-%d-%Y")}'
     elif exp_type == 'Weekly':
         ws = today - timedelta(days=today.weekday())
         exp_week = st.date_input('Week start (Monday)', value=ws)
         dates = [(exp_week + timedelta(days=i)).isoformat() for i in range(7)]
-        label = f'weekly_{dates[0]}_to_{dates[-1]}'
+        label = f'weekly_{exp_week.strftime("%m-%d-%Y")}_to_{(exp_week + timedelta(days=6)).strftime("%m-%d-%Y")}'
     elif exp_type == 'Monthly':
         ec1, ec2 = st.columns(2)
         month = ec1.selectbox('Month', range(1,13), index=today.month-1,
@@ -1752,7 +1672,7 @@ elif page == 'export':
         year  = ec2.number_input('Year', 2020, 2035, today.year)
         last  = calendar.monthrange(year, month)[1]
         dates = [date(year, month, d).isoformat() for d in range(1, last+1)]
-        label = f'monthly_{year}_{month:02d}'
+        label = f'monthly_{month:02d}-{year}'
     elif exp_type == 'Yearly':
         year  = st.number_input('Year', 2020, 2035, today.year)
         dates = [date(year, m, d).isoformat()
@@ -1763,16 +1683,19 @@ elif page == 'export':
         start = ec1.date_input('Start', value=today-timedelta(days=7))
         end   = ec2.date_input('End',   value=today)
         dates = [(start + timedelta(days=i)).isoformat() for i in range((end-start).days+1)]
-        label = f'custom_{dates[0]}_to_{dates[-1]}'
+        label = f'custom_{start.strftime("%m-%d-%Y")}_to_{end.strftime("%m-%d-%Y")}'
 
     if len(dates) > 366:
         st.warning('Export limited to 366 days.'); st.stop()
 
+    # Format dates for display as MM/DD/YYYY
+    disp_start = datetime.strptime(dates[0], '%Y-%m-%d').strftime('%m/%d/%Y')
+    disp_end   = datetime.strptime(dates[-1], '%Y-%m-%d').strftime('%m/%d/%Y')
     st.markdown(
         f'<div style="background:var(--bg-card);border:1px solid var(--border);'
         f'border-radius:6px;padding:0.6rem 1rem;font-size:0.85rem;color:var(--text-muted);">'
-        f'Range: <b style="color:var(--text-primary)">{dates[0]}</b> → '
-        f'<b style="color:var(--text-primary)">{dates[-1]}</b> · '
+        f'Range: <b style="color:var(--text-primary)">{disp_start}</b> → '
+        f'<b style="color:var(--text-primary)">{disp_end}</b> · '
         f'<b style="color:var(--brand-light)">{len(dates)}</b> days</div>',
         unsafe_allow_html=True
     )
@@ -1854,7 +1777,7 @@ elif page == 'export':
             if filter_cl3 and 'Client' in df_day.columns:
                 df_day = df_day[df_day['Client'].str.contains(filter_cl3, case=False, na=False)]
             df_day = filter_accepted_columns(df_day)
-            df_day['Date Exported'] = d_str
+            df_day['Date Exported'] = d_ts.strftime('%m/%d/%Y')
             df_day = apply_aging_bucket(df_day, use_date_exported=True)
             df_day = apply_active_nulls(df_day)
             df_day = reorder_columns(df_day)
