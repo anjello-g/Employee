@@ -838,7 +838,26 @@ def load_excel(uploaded_file) -> pd.DataFrame:
         st.error(f'Error reading Excel: {e}')
         return pd.DataFrame()
 
+def clean_export_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean dataframe for export: strip time from dates, replace NaN/None with blank."""
+    df = df.copy()
+    # Replace all NaN/None/NaT with empty string
+    df = df.replace({pd.NaT: '', np.nan: '', None: ''})
+    # Strip time from known date columns
+    date_cols = ['DOJ Knack', 'Date of Separation', 'Date Exported',
+                 'Effective From', 'Effective To', 'Start', 'End',
+                 'Last Updated', 'created_at', 'updated_at', 'last_upload']
+    for col in date_cols:
+        if col in df.columns:
+            df[col] = df[col].astype(str).replace({
+                'nan': '', 'None': '', 'NaT': '', 'nat': '', 'null': ''
+            })
+            # Strip time component (e.g. "2026-03-15 00:00:00" -> "2026-03-15")
+            df[col] = df[col].apply(lambda x: x.split(' ')[0] if ' ' in str(x) and str(x) != '' else x)
+    return df
+
 def df_to_excel_bytes(df: pd.DataFrame, sheet_name='Staffing') -> bytes:
+    df = clean_export_df(df)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
@@ -1847,9 +1866,10 @@ elif page == 'export':
                 hdr = wb.add_format({'bold': True, 'bg_color': '#2b3c78', 'font_color': 'white'})
                 for i, df_day in enumerate(all_dfs):
                     sheet = dates[i].replace('-', '')[-6:]
-                    df_day.to_excel(writer, index=False, sheet_name=sheet)
+                    df_day_clean = clean_export_df(df_day)
+                    df_day_clean.to_excel(writer, index=False, sheet_name=sheet)
                     ws = writer.sheets[sheet]
-                    for j, col in enumerate(df_day.columns):
+                    for j, col in enumerate(df_day_clean.columns):
                         ws.write(0, j, col, hdr)
             status.success(f'✅ {len(all_dfs)} sheets generated!')
             st.download_button(
