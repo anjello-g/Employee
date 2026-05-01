@@ -1299,8 +1299,7 @@ def get_db_stats():
         with engine.connect() as conn:
             emp = conn.execute(text("SELECT COUNT(*) FROM employees WHERE LEFT(ecn,1)!='_'")).scalar()
             active = conn.execute(text(
-                "SELECT COUNT(*) FROM employees WHERE LEFT(ecn,1)!='_' "
-                "AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.\\"Active/Inactive\\"')) = 'Active'"
+                "SELECT COUNT(*) FROM employees WHERE LEFT(ecn,1)!='_' AND data->>'$.\"Active/Inactive\"'='Active'"
             )).scalar()
             hist = conn.execute(text('SELECT COUNT(*) FROM history')).scalar()
         return emp, active, hist
