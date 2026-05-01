@@ -1296,16 +1296,25 @@ def get_db_stats():
     if engine is None:
         return None, None, None
     try:
-        # Use current-day snapshot so stats reflect only employees valid today
         today_str = date.today().isoformat()
-        df = get_employees_at_date(today_str)
-        if df.empty:
-            emp = 0
-            active = 0
-        else:
-            emp = df['ECN'].nunique()  # ensure no duplicate ECN
-            active = len(df[df.get('Active/Inactive', pd.Series()) == 'Active']) if 'Active/Inactive' in df.columns else 0
         with engine.connect() as conn:
+            # Total employees valid today (hired on/before today, not separated before today)
+            emp = conn.execute(text("""
+                SELECT COUNT(*) FROM employees
+                WHERE LEFT(ecn,1)!='_'
+                  AND (COALESCE(data->>'$."DOJ Knack"', '') = '' OR data->>'$."DOJ Knack"' <= :today)
+                  AND (COALESCE(data->>'$."Date of Separation"', '') = '' OR data->>'$."Date of Separation"' >= :today)
+            """), {'today': today_str}).scalar()
+
+            # Active among those valid today
+            active = conn.execute(text("""
+                SELECT COUNT(*) FROM employees
+                WHERE LEFT(ecn,1)!='_'
+                  AND (COALESCE(data->>'$."DOJ Knack"', '') = '' OR data->>'$."DOJ Knack"' <= :today)
+                  AND (COALESCE(data->>'$."Date of Separation"', '') = '' OR data->>'$."Date of Separation"' >= :today)
+                  AND data->>'$."Active/Inactive"' = 'Active'
+            """), {'today': today_str}).scalar()
+
             hist = conn.execute(text('SELECT COUNT(*) FROM history')).scalar()
         return emp, active, hist
     except Exception:
@@ -1942,7 +1951,7 @@ elif page == 'history':
     params = {}
 
     if search:
-        where_clauses.append("(ecn LIKE :s OR employee_name LIKE :s)")
+        where_clauses.append("(ecn LIKE :s OR COALESCE(employee_name, '') LIKE :s)")
         params['s'] = f'%{search}%'
     if filter_field != 'All':
         where_clauses.append("field = :f")
