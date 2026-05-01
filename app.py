@@ -1464,40 +1464,100 @@ elif page == 'employees':
         st.warning('No employees found. Upload data first.')
         st.stop()
 
-    # ── Filters ─────────────────────────────────────────────────────────────
+    # ── Filters (deferred apply) ────────────────────────────────────────────
     section_label('Filters')
+
+    # Initialize filter state
+    if '_ee_filters' not in st.session_state:
+        st.session_state['_ee_filters'] = {
+            'search': '', 'status': 'All', 'bb': 'All', 'loc': 'All',
+            'cl': 'All', 'sp': 'All', 'ro': 'All', 'su': 'All'
+        }
+    if '_ee_filters_applied' not in st.session_state:
+        st.session_state['_ee_filters_applied'] = st.session_state['_ee_filters'].copy()
+
     fc = st.columns(4)
-    search      = fc[0].text_input('🔍 Search', placeholder='Name / ECN / Email', label_visibility='collapsed', key='ee_search')
-    fs_opts     = ['All'] + sorted(employees_df['Active/Inactive'].dropna().unique().tolist()) if 'Active/Inactive' in employees_df.columns else ['All']
-    filter_status = fc[1].selectbox('Status', fs_opts, key='ee_status')
-    bb_opts     = ['All'] + sorted(employees_df['Billable/Buffer'].dropna().unique().tolist()) if 'Billable/Buffer' in employees_df.columns else ['All']
-    filter_bb   = fc[2].selectbox('Billable/Buffer', bb_opts, key='ee_bb')
-    loc_opts    = ['All'] + sorted(employees_df['Location'].dropna().unique().tolist()) if 'Location' in employees_df.columns else ['All']
-    filter_loc  = fc[3].selectbox('Location', loc_opts, key='ee_loc')
+    with fc[0]:
+        search_input = st.text_input('🔍 Search', placeholder='Name / ECN / Email', 
+                                      value=st.session_state['_ee_filters']['search'],
+                                      label_visibility='collapsed', key='ee_search')
+    with fc[1]:
+        fs_opts = ['All'] + sorted(employees_df['Active/Inactive'].dropna().unique().tolist()) if 'Active/Inactive' in employees_df.columns else ['All']
+        status_input = st.selectbox('Status', fs_opts, 
+                                     index=fs_opts.index(st.session_state['_ee_filters']['status']) if st.session_state['_ee_filters']['status'] in fs_opts else 0,
+                                     key='ee_status_input')
+    with fc[2]:
+        bb_opts = ['All'] + sorted(employees_df['Billable/Buffer'].dropna().unique().tolist()) if 'Billable/Buffer' in employees_df.columns else ['All']
+        bb_input = st.selectbox('Billable/Buffer', bb_opts,
+                               index=bb_opts.index(st.session_state['_ee_filters']['bb']) if st.session_state['_ee_filters']['bb'] in bb_opts else 0,
+                               key='ee_bb_input')
+    with fc[3]:
+        loc_opts = ['All'] + sorted(employees_df['Location'].dropna().unique().tolist()) if 'Location' in employees_df.columns else ['All']
+        loc_input = st.selectbox('Location', loc_opts,
+                                index=loc_opts.index(st.session_state['_ee_filters']['loc']) if st.session_state['_ee_filters']['loc'] in loc_opts else 0,
+                                key='ee_loc_input')
 
     fc2 = st.columns(4)
-    cl_opts  = ['All'] + sorted(employees_df['Client'].dropna().unique().tolist()) if 'Client' in employees_df.columns else ['All']
-    filter_cl = fc2[0].selectbox('Client', cl_opts, key='ee_cl')
-    sp_opts  = ['All'] + sorted(employees_df['Sub-Process'].dropna().unique().tolist()) if 'Sub-Process' in employees_df.columns else ['All']
-    filter_sp = fc2[1].selectbox('Sub-Process', sp_opts, key='ee_sp')
-    ro_opts  = ['All'] + sorted(employees_df['Role'].dropna().unique().tolist()) if 'Role' in employees_df.columns else ['All']
-    filter_ro = fc2[2].selectbox('Role', ro_opts, key='ee_ro')
-    su_opts  = ['All'] + sorted(employees_df['Supervisor'].dropna().unique().tolist()) if 'Supervisor' in employees_df.columns else ['All']
-    filter_su = fc2[3].selectbox('Supervisor', su_opts, key='ee_su')
+    with fc2[0]:
+        cl_opts = ['All'] + sorted(employees_df['Client'].dropna().unique().tolist()) if 'Client' in employees_df.columns else ['All']
+        cl_input = st.selectbox('Client', cl_opts,
+                               index=cl_opts.index(st.session_state['_ee_filters']['cl']) if st.session_state['_ee_filters']['cl'] in cl_opts else 0,
+                               key='ee_cl_input')
+    with fc2[1]:
+        sp_opts = ['All'] + sorted(employees_df['Sub-Process'].dropna().unique().tolist()) if 'Sub-Process' in employees_df.columns else ['All']
+        sp_input = st.selectbox('Sub-Process', sp_opts,
+                               index=sp_opts.index(st.session_state['_ee_filters']['sp']) if st.session_state['_ee_filters']['sp'] in sp_opts else 0,
+                               key='ee_sp_input')
+    with fc2[2]:
+        ro_opts = ['All'] + sorted(employees_df['Role'].dropna().unique().tolist()) if 'Role' in employees_df.columns else ['All']
+        ro_input = st.selectbox('Role', ro_opts,
+                               index=ro_opts.index(st.session_state['_ee_filters']['ro']) if st.session_state['_ee_filters']['ro'] in ro_opts else 0,
+                               key='ee_ro_input')
+    with fc2[3]:
+        su_opts = ['All'] + sorted(employees_df['Supervisor'].dropna().unique().tolist()) if 'Supervisor' in employees_df.columns else ['All']
+        su_input = st.selectbox('Supervisor', su_opts,
+                               index=su_opts.index(st.session_state['_ee_filters']['su']) if st.session_state['_ee_filters']['su'] in su_opts else 0,
+                               key='ee_su_input')
 
+    # Apply / Remove buttons
+    fb1, fb2, fb3 = st.columns([1, 1, 6])
+    with fb1:
+        if st.button('🔍 Apply Filters', type='primary', key='ee_apply'):
+            st.session_state['_ee_filters'] = {
+                'search': search_input, 'status': status_input, 'bb': bb_input,
+                'loc': loc_input, 'cl': cl_input, 'sp': sp_input, 'ro': ro_input, 'su': su_input
+            }
+            st.session_state['_ee_filters_applied'] = st.session_state['_ee_filters'].copy()
+            st.rerun()
+    with fb2:
+        if st.button('❌ Remove Filters', type='secondary', key='ee_remove'):
+            st.session_state['_ee_filters'] = {
+                'search': '', 'status': 'All', 'bb': 'All', 'loc': 'All',
+                'cl': 'All', 'sp': 'All', 'ro': 'All', 'su': 'All'
+            }
+            st.session_state['_ee_filters_applied'] = st.session_state['_ee_filters'].copy()
+            st.rerun()
+    with fb3:
+        # Show active filter count
+        active_count = sum(1 for v in st.session_state['_ee_filters_applied'].values() if v != '' and v != 'All')
+        if active_count > 0:
+            st.caption(f'{active_count} filter(s) active')
+
+    # Apply stored filters to dataframe
+    f = st.session_state['_ee_filters_applied']
     def _apply(df, col, val):
         return df[df[col] == val] if val != 'All' and col in df.columns else df
 
-    employees_df = _apply(employees_df, 'Active/Inactive', filter_status)
-    employees_df = _apply(employees_df, 'Billable/Buffer', filter_bb)
-    employees_df = _apply(employees_df, 'Location', filter_loc)
-    employees_df = _apply(employees_df, 'Client', filter_cl)
-    employees_df = _apply(employees_df, 'Sub-Process', filter_sp)
-    employees_df = _apply(employees_df, 'Role', filter_ro)
-    employees_df = _apply(employees_df, 'Supervisor', filter_su)
+    employees_df = _apply(employees_df, 'Active/Inactive', f['status'])
+    employees_df = _apply(employees_df, 'Billable/Buffer', f['bb'])
+    employees_df = _apply(employees_df, 'Location', f['loc'])
+    employees_df = _apply(employees_df, 'Client', f['cl'])
+    employees_df = _apply(employees_df, 'Sub-Process', f['sp'])
+    employees_df = _apply(employees_df, 'Role', f['ro'])
+    employees_df = _apply(employees_df, 'Supervisor', f['su'])
 
-    if search:
-        s = search.lower()
+    if f['search']:
+        s = f['search'].lower()
         mask = (
             employees_df.get('Employee', pd.Series()).str.lower().str.contains(s, na=False) |
             employees_df.get('ECN', pd.Series()).str.lower().str.contains(s, na=False) |
@@ -1516,7 +1576,7 @@ elif page == 'employees':
     section_label('Selection')
     edit_mode = st.radio('Edit mode', ['Single select', 'Bulk edit'], horizontal=True, key='ee_mode')
 
-    # Track selected indices in session_state for persistence across reruns
+    # Initialize session state
     if '_ee_selected' not in st.session_state:
         st.session_state['_ee_selected'] = []
     if '_ee_prev_mode' not in st.session_state:
@@ -1528,38 +1588,24 @@ elif page == 'employees':
         st.session_state['_ee_prev_mode'] = edit_mode
         st.rerun()
 
-    sa1, sa2, sa3 = st.columns([1, 1, 4])
-    with sa1:
-        if st.button('☑️  Select All', key='ee_all'):
-            st.session_state['_ee_selected'] = employees_df.index.tolist()
-            st.rerun()
-    with sa2:
-        if st.button('⬜  Clear', key='ee_clear'):
-            st.session_state['_ee_selected'] = []
-            st.session_state['_bulk_edit'] = False
-            st.rerun()
-    with sa3:
-        st.caption(f'{len(employees_df):,} employees shown')
+    st.caption(f'{len(employees_df):,} employees shown')
 
-    # Build dataframe with checkboxes — use session_state for persistence
-    edit_df = employees_df[display_cols].copy()
-    edit_df.insert(0, 'Select', False)
-    for idx in st.session_state['_ee_selected']:
-        if idx in edit_df.index:
-            edit_df.at[idx, 'Select'] = True
-
-    edited = st.data_editor(
-        edit_df, use_container_width=True, hide_index=True,
-        column_config={'Select': st.column_config.CheckboxColumn('Select', default=False)},
-        disabled=display_cols,
+    # ── Display table with row selection ────────────────────────────────────
+    sel = st.dataframe(
+        employees_df[display_cols],
+        use_container_width=True,
+        hide_index=True,
+        on_select='rerun',
+        selection_mode='multi-row' if edit_mode == 'Bulk edit' else 'single-row'
     )
-    # Update session_state with current selections
-    st.session_state['_ee_selected'] = edited[edited['Select'] == True].index.tolist()
-    sel_idx = st.session_state['_ee_selected']
+
+    selected_rows = []
+    if sel and sel.selection.rows:
+        selected_rows = [employees_df.index[i] for i in sel.selection.rows if i < len(employees_df)]
 
     # ── Single edit ─────────────────────────────────────────────────────────
-    if edit_mode == 'Single select' and len(sel_idx) >= 1:
-        emp = employees_df.loc[sel_idx[0]].to_dict()
+    if edit_mode == 'Single select' and len(selected_rows) == 1:
+        emp = employees_df.loc[selected_rows[0]].to_dict()
         ecn = emp['ECN']
 
         @st.dialog(f'✏️ Edit — {emp.get("Employee", ecn)}', width='large')
@@ -1599,21 +1645,20 @@ elif page == 'employees':
                 saved = sum(1 for f, v in changes.items() if record_manual_edit(ecn, f, v, eff_from_s, eff_to_s)[0])
                 if saved:
                     st.success(f'{saved} field(s) updated!')
-                    st.session_state['_ee_selected'] = []
                     st.rerun()
 
         _single_edit()
 
     # ── Bulk edit ────────────────────────────────────────────────────────────
-    elif edit_mode == 'Bulk edit' and len(sel_idx) > 1:
+    elif edit_mode == 'Bulk edit' and len(selected_rows) > 1:
         if st.button('🔧  Bulk Edit Selected', type='primary', key='be_open'):
             st.session_state['_bulk_edit'] = True
             st.rerun()
 
         if st.session_state.get('_bulk_edit'):
-            @st.dialog(f'🔧 Bulk Edit — {len(sel_idx)} Employees', width='large')
+            @st.dialog(f'🔧 Bulk Edit — {len(selected_rows)} Employees', width='large')
             def _bulk_edit():
-                emps = [employees_df.loc[i].to_dict() for i in sel_idx]
+                emps = [employees_df.loc[i].to_dict() for i in selected_rows]
                 ecns  = [e['ECN'] for e in emps]
                 names = [e.get('Employee', e['ECN']) for e in emps]
                 st.caption(', '.join(names[:5]) + ('…' if len(names) > 5 else ''))
@@ -1667,7 +1712,6 @@ elif page == 'employees':
                             if record_manual_edit(ecn, f, v, eff_from_s, eff_to_s)[0]
                         )
                         st.success(f'{saved} field updates saved!')
-                        st.session_state['_ee_selected'] = []
                         st.session_state['_bulk_edit'] = False
                         st.rerun()
                 with bc2:
@@ -1867,13 +1911,23 @@ elif page == 'history':
 
     engine = get_engine()
 
-    # ── Filters ──────────────────────────────────────────────────────────────
+    # ── Filters (deferred apply) ────────────────────────────────────────────
     section_label('Filters')
-    f1, f2, f3, f4, f5 = st.columns([2, 2, 2, 2, 1])
+
+    if '_hist_filters' not in st.session_state:
+        st.session_state['_hist_filters'] = {
+            'search': '', 'field': 'All', 'source': 'All', 'date_mode': 'All dates',
+            'date_from': date(2024, 1, 1), 'date_to': date.today()
+        }
+    if '_hist_filters_applied' not in st.session_state:
+        st.session_state['_hist_filters_applied'] = st.session_state['_hist_filters'].copy()
+
+    f1, f2, f3, f4 = st.columns([2, 2, 2, 2])
     with f1:
-        search = st.text_input('🔍 Search ECN / Name', placeholder='e.g. EMP001', key='hist_search')
+        search_input = st.text_input('🔍 Search ECN / Name', 
+                                      value=st.session_state['_hist_filters']['search'],
+                                      placeholder='e.g. EMP001', key='hist_search_input')
     with f2:
-        # Load distinct fields for filter
         try:
             with engine.connect() as conn:
                 field_rows = conn.execute(text(
@@ -1882,44 +1936,76 @@ elif page == 'history':
             field_opts = ['All'] + [r[0] for r in field_rows if r[0]]
         except Exception:
             field_opts = ['All']
-        filter_field = st.selectbox('Field', field_opts, key='hist_field')
+        field_input = st.selectbox('Field', field_opts,
+                                   index=field_opts.index(st.session_state['_hist_filters']['field']) if st.session_state['_hist_filters']['field'] in field_opts else 0,
+                                   key='hist_field_input')
     with f3:
-        filter_source = st.selectbox('Source', ['All', 'excel_upload', 'manual_edit'], key='hist_source')
+        source_input = st.selectbox('Source', ['All', 'excel_upload', 'manual_edit'],
+                                    index=['All', 'excel_upload', 'manual_edit'].index(st.session_state['_hist_filters']['source']),
+                                    key='hist_source_input')
     with f4:
-        date_mode = st.selectbox('Date filter', ['All dates', 'Start date range'], key='hist_date_mode')
-    with f5:
-        if st.button('🔄 Reset', key='hist_reset', use_container_width=True):
-            for k in ['hist_search', 'hist_field', 'hist_source', 'hist_date_mode',
-                      'hist_date_from', 'hist_date_to']:
-                if k in st.session_state:
-                    del st.session_state[k]
-            st.rerun()
+        date_mode_input = st.selectbox('Date filter', ['All dates', 'Start date range'],
+                                       index=['All dates', 'Start date range'].index(st.session_state['_hist_filters']['date_mode']),
+                                       key='hist_date_mode_input')
 
-    date_from, date_to = None, None
-    if date_mode == 'Start date range':
+    date_from_input, date_to_input = None, None
+    if date_mode_input == 'Start date range':
         d1, d2 = st.columns(2)
         with d1:
-            date_from = st.date_input('From', value=date(2024, 1, 1), key='hist_date_from')
+            date_from_input = st.date_input('From', 
+                                            value=st.session_state['_hist_filters']['date_from'],
+                                            key='hist_date_from_input')
         with d2:
-            date_to = st.date_input('To', value=date.today(), key='hist_date_to')
+            date_to_input = st.date_input('To', 
+                                          value=st.session_state['_hist_filters']['date_to'],
+                                          key='hist_date_to_input')
 
-    # ── Build query ──────────────────────────────────────────────────────────
+    # Apply / Remove buttons
+    fb1, fb2, fb3 = st.columns([1, 1, 6])
+    with fb1:
+        if st.button('🔍 Apply Filters', type='primary', key='hist_apply'):
+            st.session_state['_hist_filters'] = {
+                'search': search_input, 'field': field_input, 'source': source_input,
+                'date_mode': date_mode_input,
+                'date_from': date_from_input or date(2024, 1, 1),
+                'date_to': date_to_input or date.today()
+            }
+            st.session_state['_hist_filters_applied'] = st.session_state['_hist_filters'].copy()
+            st.rerun()
+    with fb2:
+        if st.button('❌ Remove Filters', type='secondary', key='hist_remove'):
+            st.session_state['_hist_filters'] = {
+                'search': '', 'field': 'All', 'source': 'All', 'date_mode': 'All dates',
+                'date_from': date(2024, 1, 1), 'date_to': date.today()
+            }
+            st.session_state['_hist_filters_applied'] = st.session_state['_hist_filters'].copy()
+            st.rerun()
+    with fb3:
+        f = st.session_state['_hist_filters_applied']
+        active_count = sum(1 for k, v in f.items() if k not in ('date_from', 'date_to') and v not in ('', 'All', 'All dates'))
+        if f['date_mode'] == 'Start date range':
+            active_count += 1
+        if active_count > 0:
+            st.caption(f'{active_count} filter(s) active')
+
+    # ── Build query from applied filters ────────────────────────────────────
+    f = st.session_state['_hist_filters_applied']
     where_clauses = []
     params = {}
 
-    if search:
+    if f['search']:
         where_clauses.append("(ecn LIKE :s OR COALESCE(employee_name, '') LIKE :s)")
-        params['s'] = f'%{search}%'
-    if filter_field != 'All':
-        where_clauses.append("field = :f")
-        params['f'] = filter_field
-    if filter_source != 'All':
+        params['s'] = f'%{f["search"]}%'
+    if f['field'] != 'All':
+        where_clauses.append("field = :fld")
+        params['fld'] = f['field']
+    if f['source'] != 'All':
         where_clauses.append("source = :src")
-        params['src'] = filter_source
-    if date_mode == 'Start date range' and date_from and date_to:
+        params['src'] = f['source']
+    if f['date_mode'] == 'Start date range':
         where_clauses.append("start_date BETWEEN :df AND :dt")
-        params['df'] = date_from.isoformat()
-        params['dt'] = date_to.isoformat()
+        params['df'] = f['date_from'].isoformat()
+        params['dt'] = f['date_to'].isoformat()
 
     where_sql = ('WHERE ' + ' AND '.join(where_clauses)) if where_clauses else ''
 
