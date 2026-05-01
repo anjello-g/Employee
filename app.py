@@ -8,6 +8,7 @@ import calendar
 import certifi
 import json
 import warnings
+import hashlib
 from urllib.parse import quote_plus, urlparse, urlunparse
 from collections import defaultdict
 
@@ -43,7 +44,8 @@ CORE_COLS = [
     'Manager','Role','Process Owner','Billable/Buffer','DOJ Knack',
     'Date of Separation','Active/Inactive','Email','NT Login','Structure',
     'Department','Location','Gender','Global ID (GPP)','Attrition Type',
-    'Reason for Attrition','CDP Email','Overall Location','Aging Bucket'
+    'Reason for Attrition','CDP Email','Overall Location','Aging Bucket',
+    'Effective From','Effective To'
 ]
 DISPLAY_ORDER = CORE_COLS[:]
 
@@ -632,12 +634,35 @@ def get_db():
               Column('updated', Integer),
               Column('skipped_manual', Integer),
               mysql_engine='InnoDB')
+        Table('users', metadata,
+              Column('id', Integer, primary_key=True, autoincrement=True),
+              Column('username', String(100), unique=True, nullable=False),
+              Column('password_hash', String(256), nullable=False),
+              Column('role', String(20), default='user'),
+              Column('created_at', String(10)),
+              Column('last_login', String(20)),
+              mysql_engine='InnoDB')
         metadata.create_all(engine)
+        _init_default_user(engine)
         st.session_state.pop('_db_err', None)
         return engine, metadata
     except Exception as e:
         st.session_state['_db_err'] = str(e)
         return None, None
+
+def _init_default_user(engine):
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("SELECT COUNT(*) FROM users WHERE username='Knack'")).scalar()
+            if row == 0:
+                pwd_hash = hashlib.sha256('Knack1234'.encode()).hexdigest()
+                conn.execute(text(
+                    "INSERT INTO users (username, password_hash, role, created_at) "
+                    "VALUES (:u, :p, :r, :d)"
+                ), {'u': 'Knack', 'p': pwd_hash, 'r': 'admin', 'd': date.today().isoformat()})
+                conn.commit()
+    except Exception:
+        pass
 
 def get_engine():
     engine, _ = get_db()
@@ -910,18 +935,31 @@ def df_to_excel_bytes(df: pd.DataFrame, sheet_name='Staffing') -> bytes:
 
 def generate_template_bytes() -> bytes:
     data = {
-        'ECN': ['EMP001', 'EMP002'], 'Employee': ['John Doe', 'Jane Smith'],
-        'Client': ['ABC Corp', 'XYZ Inc'], 'Sub-Process': ['Support', 'Billing'],
-        'Supervisor': ['Manager A', 'Manager B'], 'Manager': ['Director X', 'Director Y'],
-        'Role': ['Agent', 'Senior Agent'], 'Process Owner': ['Owner 1', 'Owner 2'],
-        'Billable/Buffer': ['Billable', 'Buffer'], 'DOJ Knack': ['2024-01-15', '2024-03-01'],
-        'Date of Separation': ['', ''], 'Active/Inactive': ['Active', 'Active'],
-        'Email': ['john@company.com', 'jane@company.com'], 'NT Login': ['jdoe', 'jsmith'],
-        'Structure': ['Ops', 'Ops'], 'Department': ['Customer Service', 'Finance'],
-        'Location': ['Manila', 'Cebu'], 'Gender': ['Male', 'Female'],
-        'Global ID (GPP)': ['GPP001', 'GPP002'], 'Attrition Type': ['', ''],
-        'Reason for Attrition': ['', ''], 'CDP Email': ['john.cdp@co.com', 'jane.cdp@co.com'],
-        'Overall Location': ['PH', 'PH'],
+        'ECN': ['10001', '10002'],
+        'Employee': ['John Doe', 'Jane Smith'],
+        'Client': ['Client 1', 'Client 2'],
+        'Sub-Process': ['Subprocess', 'Subprocess'],
+        'Supervisor': ['Supervisor A', 'Supervisor  B'],
+        'Manager': ['Manager X', 'Manager Y'],
+        'Role': ['Process Associate', 'Senior Agent'],
+        'Process Owner': ['Ops Director 1', 'Ops Director 2'],
+        'Billable/Buffer': ['Billable', 'Buffer'],
+        'DOJ Knack': ['04/15/2026', '03/18/2025'],
+        'Date of Separation': ['', '06/20/2025'],
+        'Active/Inactive': ['Active', 'Inactive'],
+        'Email': ['name.lastname@knackrcm.com', 'name@knacrcm.com'],
+        'NT Login': ['jdoe', 'jsmith'],
+        'Structure': ['Process Associate', 'Process Associate'],
+        'Department': ['WFM / MIS', 'Operations'],
+        'Location': ['Ortigas', 'Tech Hub1 '],
+        'Gender': ['Male', 'Female'],
+        'Global ID (GPP)': ['AHID1234', 'AHID12345'],
+        'Attrition Type': ['', ''],
+        'Reason for Attrition': ['', ''],
+        'CDP Email': ['john@healthybos.com', 'jane@healthybos.com'],
+        'Overall Location': ['Ortigas', 'Clark'],
+        'Effective From': ['', ''],
+        'Effective To': ['', ''],
     }
     return df_to_excel_bytes(pd.DataFrame(data), sheet_name='Consolidated Staffing')
 
@@ -1308,18 +1346,162 @@ def get_db_stats():
         return None, None, None
 
 # ─── SIDEBAR ─────────────────────────────────────────────────────────────────
+# ─── AUTH ────────────────────────────────────────────────────────────────────
+def _hash_password(pwd: str) -> str:
+    return hashlib.sha256(pwd.encode()).hexdigest()
+
+def _verify_user(username: str, password: str) -> dict:
+    engine = get_engine()
+    if engine is None:
+        return None
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT id, username, role FROM users WHERE username=:u AND password_hash=:p"
+            ), {'u': username.strip(), 'p': _hash_password(password)}).mappings().fetchone()
+            if row:
+                conn.execute(text(
+                    "UPDATE users SET last_login=:now WHERE username=:u"
+                ), {'now': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'u': username.strip()})
+                conn.commit()
+                return dict(row)
+    except Exception:
+        pass
+    return None
+
+def _add_user(username: str, password: str, role: str = 'user'):
+    engine = get_engine()
+    if engine is None:
+        return False, 'Database not connected'
+    try:
+        with engine.connect() as conn:
+            exists = conn.execute(text("SELECT 1 FROM users WHERE username=:u"), {'u': username.strip()}).fetchone()
+            if exists:
+                return False, 'Username already exists'
+            conn.execute(text(
+                "INSERT INTO users (username, password_hash, role, created_at) "
+                "VALUES (:u, :p, :r, :d)"
+            ), {'u': username.strip(), 'p': _hash_password(password), 'r': role,
+                'd': date.today().isoformat()})
+            conn.commit()
+        return True, 'User created'
+    except Exception as e:
+        return False, str(e)[:120]
+
+def _delete_user(user_id: int):
+    engine = get_engine()
+    if engine is None:
+        return False, 'Database not connected'
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("DELETE FROM users WHERE id=:id"), {'id': user_id})
+            conn.commit()
+        return True, 'User deleted'
+    except Exception as e:
+        return False, str(e)[:120]
+
+def _get_all_users() -> pd.DataFrame:
+    engine = get_engine()
+    if engine is None:
+        return pd.DataFrame()
+    try:
+        df = pd.read_sql(text("SELECT id, username, role, created_at, last_login FROM users ORDER BY id"), engine)
+        df.columns = ['ID', 'Username', 'Role', 'Created', 'Last Login']
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def _render_login():
+    st.markdown(f"""
+    <style>
+    .login-container {{
+        max-width: 420px;
+        margin: 8vh auto 0 auto;
+        padding: 2.5rem 2rem;
+        background: var(--bg-card, #141f35);
+        border: 1px solid var(--border, rgba(95,183,222,0.12));
+        border-radius: 16px;
+        box-shadow: 0 24px 64px rgba(0,0,0,0.5);
+    }}
+    .login-logo {{
+        text-align: center;
+        margin-bottom: 1.5rem;
+    }}
+    .login-logo img {{
+        width: 64px;
+        height: 64px;
+        border-radius: 12px;
+    }}
+    .login-title {{
+        text-align: center;
+        font-family: 'Plus Jakarta Sans', sans-serif;
+        font-size: 1.4rem;
+        font-weight: 800;
+        color: #e8f4f8;
+        margin-bottom: 0.25rem;
+    }}
+    .login-subtitle {{
+        text-align: center;
+        font-size: 0.8rem;
+        color: #7a9bb5;
+        margin-bottom: 2rem;
+    }}
+    </style>
+    <div class="login-container">
+        <div class="login-logo">
+            <img src="https://kimi-web-img.moonshot.cn/img/knackrcm.com/26ef9a05ac06e2c7d058a5cafefa681569032b17.png" />
+        </div>
+        <div class="login-title">Knack RCM</div>
+        <div class="login-subtitle">Employee Dashboard</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    with st.container():
+        c1, c2, c3 = st.columns([1, 3, 1])
+        with c2:
+            username = st.text_input('Username', key='login_user', placeholder='Enter username')
+            password = st.text_input('Password', key='login_pass', type='password', placeholder='Enter password')
+            if st.button('Sign In', type='primary', use_container_width=True, key='login_btn'):
+                user = _verify_user(username, password)
+                if user:
+                    st.session_state['_auth_user'] = user
+                    st.session_state['_auth_time'] = datetime.now().isoformat()
+                    st.toast(f"Welcome, {user['username']}!", icon='👋')
+                    st.rerun()
+                else:
+                    st.error('Invalid username or password')
+
 NAV = {
     'upload':    ('📤', 'Upload & Sync'),
     'employees': ('👤', 'Employees'),
     'export':    ('📊', 'Export'),
     'history':   ('📜', 'History'),
     'dbtools':   ('🛠️', 'DB Tools'),
+    'users':     ('🔐', 'Users'),
 }
 
 if 'nav_page' not in st.session_state:
     st.session_state.nav_page = 'upload'
 
+# ─── LOGIN GATE ──────────────────────────────────────────────────────────────
+if '_auth_user' not in st.session_state:
+    _render_login()
+    st.stop()
+
 with st.sidebar:
+    user = st.session_state['_auth_user']
+    st.markdown(f"""
+    <div style="text-align:center; padding:0.5rem 0 0.75rem 0; border-bottom:1px solid rgba(95,183,222,0.12); margin-bottom:0.75rem;">
+        <div style="font-size:0.75rem; color:#7a9bb5; font-weight:600; letter-spacing:0.05em; text-transform:uppercase;">Signed in as</div>
+        <div style="font-size:1rem; color:#5fb7de; font-weight:700;">{user['username']}</div>
+        <div style="font-size:0.7rem; color:#3d5a72;">{user['role']}</div>
+    </div>
+    """, unsafe_allow_html=True)
+    if st.button('🚪  Sign Out', use_container_width=True, type='secondary', key='logout_btn'):
+        st.session_state.pop('_auth_user', None)
+        st.session_state.pop('_auth_time', None)
+        st.rerun()
+    st.markdown('<div style="height:0.75rem;"></div>', unsafe_allow_html=True)
     render_sidebar_brand()
 
     for key, (icon, label) in NAV.items():
@@ -2200,3 +2382,69 @@ elif page == 'dbtools':
                 st.info('No uploads logged yet.')
         except Exception as e:
             st.error(f'Could not load upload log: {e}')
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE: USERS
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == 'users':
+    page_header('User Management', 'Manage dashboard access accounts')
+    if not db_connected():
+        st.error('Connect TiDB first.'); st.stop()
+
+    user = st.session_state.get('_auth_user', {})
+    if user.get('role') != 'admin':
+        st.warning('Admin access required to manage users.')
+        st.stop()
+
+    # Stats
+    users_df = _get_all_users()
+    if not users_df.empty:
+        c1, c2 = st.columns(2)
+        with c1: st.markdown(stat_card('Total Users', f"{len(users_df):,}", '👤'), unsafe_allow_html=True)
+        with c2: st.markdown(stat_card('Admins', f"{(users_df['Role']=='admin').sum():,}", '🔐', '#22c55e'), unsafe_allow_html=True)
+        st.markdown('<div style="height:1rem;"></div>', unsafe_allow_html=True)
+
+    section_label('Create User')
+    with st.container(border=True):
+        c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
+        with c1:
+            new_user = st.text_input('Username', key='new_user_name', placeholder='e.g. john.doe')
+        with c2:
+            new_pass = st.text_input('Password', key='new_user_pass', type='password', placeholder='Min 6 characters')
+        with c3:
+            new_role = st.selectbox('Role', ['user', 'admin'], key='new_user_role')
+        with c4:
+            st.markdown('<div style="height:1.6rem;"></div>', unsafe_allow_html=True)
+            if st.button('➕ Create', type='primary', key='create_user_btn'):
+                if not new_user.strip():
+                    st.error('Username required')
+                elif len(new_pass) < 6:
+                    st.error('Password must be at least 6 characters')
+                else:
+                    ok, msg = _add_user(new_user, new_pass, new_role)
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+    section_label('Existing Users')
+    if not users_df.empty:
+        users_df['Created'] = users_df['Created'].apply(_format_date_for_export)
+        users_df['Last Login'] = users_df['Last Login'].fillna('').apply(lambda x: _format_date_for_export(x) if x else '—')
+        sel = st.dataframe(users_df, use_container_width=True, hide_index=True,
+                           on_select='rerun', selection_mode='multi-row')
+        if sel and sel.selection.rows:
+            to_delete = [users_df.iloc[i]['ID'] for i in sel.selection.rows]
+            to_names = [users_df.iloc[i]['Username'] for i in sel.selection.rows]
+            st.warning(f"Selected: {', '.join(to_names)}")
+            if st.button('🗑️  Delete Selected', type='primary', key='del_users_btn'):
+                deleted = 0
+                for uid in to_delete:
+                    ok, msg = _delete_user(int(uid))
+                    if ok:
+                        deleted += 1
+                st.success(f'Deleted {deleted} user(s)')
+                st.rerun()
+    else:
+        st.info('No users found.')
