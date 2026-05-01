@@ -20,8 +20,317 @@ try:
 except ImportError:
     TIDB_AVAILABLE = False
 
-st.set_page_config(page_title='Knack RCM | Employee Dashboard', page_icon='https://kimi-web-img.moonshot.cn/img/knackrcm.com/26ef9a05ac06e2c7d058a5cafefa681569032b17.png', layout='wide', initial_sidebar_state='expanded')
+# ─── PAGE CONFIG ────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title='Knack RCM | Employee Dashboard',
+    page_icon='https://kimi-web-img.moonshot.cn/img/knackrcm.com/26ef9a05ac06e2c7d058a5cafefa681569032b17.png',
+    layout='wide',
+    initial_sidebar_state='expanded'
+)
 
+# ─── BRAND COLOR PALETTE ────────────────────────────────────────────────────
+BRAND_DARK_BLUE = '#2b3c78'
+BRAND_LIGHT_BLUE = '#5fb7de'
+BRAND_MEDIUM_BLUE = '#0968b1'
+BRAND_MAROON = '#751026'
+BRAND_ORANGE = '#f47e20'
+BRAND_LIGHT_GRAY = '#d5d9db'
+BRAND_OFF_WHITE = '#ecf3f4'
+
+# ─── CORE ACCEPTED COLUMNS ──────────────────────────────────────────────────
+CORE_COLS = [
+    'Date Exported', 'ECN', 'Employee', 'Client', 'Sub-Process', 'Supervisor',
+    'Manager', 'Role', 'Process Owner', 'Billable/Buffer', 'DOJ Knack',
+    'Date of Separation', 'Active/Inactive', 'Email', 'NT Login', 'Structure',
+    'Department', 'Location', 'Gender', 'Global ID (GPP)', 'Attrition Type',
+    'Reason for Attrition', 'CDP Email', 'Overall Location', 'Aging Bucket'
+]
+
+DISPLAY_ORDER = [
+    'Date Exported', 'ECN', 'Employee', 'Client', 'Sub-Process', 'Supervisor',
+    'Manager', 'Role', 'Process Owner', 'Billable/Buffer', 'DOJ Knack',
+    'Date of Separation', 'Active/Inactive', 'Email', 'NT Login', 'Structure',
+    'Department', 'Location', 'Gender', 'Global ID (GPP)', 'Attrition Type',
+    'Reason for Attrition', 'CDP Email', 'Overall Location', 'Aging Bucket'
+]
+
+def get_custom_columns():
+    engine = get_engine()
+    if engine is None:
+        return st.session_state.get('_custom_cols', [])
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT ecn, data FROM employees WHERE ecn LIKE '_COL_%'")).fetchall()
+            cols = []
+            for row in result:
+                data = json.loads(row[1]) if isinstance(row[1], str) else row[1]
+                if data.get('approved') and data.get('col_name'):
+                    cols.append(data.get('col_name'))
+            return cols
+    except Exception:
+        return st.session_state.get('_custom_cols', [])
+
+def add_custom_column(col_name: str):
+    engine = get_engine()
+    if engine:
+        with engine.connect() as conn:
+            conn.execute(text(
+                'INSERT IGNORE INTO employees (ecn, data, created_at, updated_at, last_upload) VALUES (:ecn, :data, :d, :d, :d)'
+            ), {
+                'ecn': '_COL_' + col_name,
+                'data': json.dumps({'col_name': col_name, 'approved': True}),
+                'd': '2000-01-01'
+            })
+            conn.commit()
+    custom = st.session_state.get('_custom_cols', [])
+    if col_name not in custom:
+        custom.append(col_name)
+        st.session_state['_custom_cols'] = custom
+    st.cache_data.clear()
+
+def remove_custom_column(col_name: str):
+    engine = get_engine()
+    if engine:
+        with engine.connect() as conn:
+            conn.execute(text("DELETE FROM employees WHERE ecn = :ecn"), {'ecn': '_COL_' + col_name})
+            conn.commit()
+    custom = st.session_state.get('_custom_cols', [])
+    if col_name in custom:
+        custom.remove(col_name)
+        st.session_state['_custom_cols'] = custom
+    st.cache_data.clear()
+
+def get_all_accepted_columns():
+    return list(dict.fromkeys(CORE_COLS + get_custom_columns()))
+
+# ─── CUSTOM THEME CSS ───────────────────────────────────────────────────────
+def inject_theme():
+    css = f"""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap');
+
+    html, body, [class*="css"] {{
+        font-family: 'Outfit', 'Century Gothic', sans-serif !important;
+    }}
+    
+    .stApp {{
+        background-color: #0b1120 !important;
+        color: {BRAND_OFF_WHITE} !important;
+    }}
+    
+    /* Sidebar */
+    section[data-testid="stSidebar"] {{
+        background-color: {BRAND_DARK_BLUE} !important;
+        border-right: 1px solid rgba(255,255,255,0.08) !important;
+    }}
+    section[data-testid="stSidebar"] .stMarkdown {{
+        color: {BRAND_OFF_WHITE} !important;
+    }}
+    
+    /* Sidebar Buttons (Navigation) */
+    section[data-testid="stSidebar"] .stButton > button {{
+        width: 100% !important;
+        border-radius: 4px !important;
+        border: 1px solid rgba(255,255,255,0.08) !important;
+        background-color: rgba(9, 104, 177, 0.35) !important;
+        color: {BRAND_OFF_WHITE} !important;
+        text-align: left !important;
+        padding: 0.65rem 1rem !important;
+        margin-bottom: 0.35rem !important;
+        font-family: 'Outfit', sans-serif !important;
+        font-size: 0.95rem !important;
+        transition: all 0.2s ease !important;
+        box-shadow: none !important;
+    }}
+    section[data-testid="stSidebar"] .stButton > button:hover {{
+        background-color: rgba(95, 183, 222, 0.45) !important;
+        border-color: {BRAND_LIGHT_BLUE} !important;
+        transform: translateX(2px) !important;
+    }}
+    section[data-testid="stSidebar"] .stButton > button[data-testid="baseButton-primary"] {{
+        background-color: {BRAND_ORANGE} !important;
+        border-color: {BRAND_ORANGE} !important;
+        color: white !important;
+        font-weight: 600 !important;
+        box-shadow: 0 2px 8px rgba(244, 126, 32, 0.35) !important;
+    }}
+    
+    /* Main Headers */
+    h1, h2, h3, h4, h5 {{
+        color: {BRAND_LIGHT_BLUE} !important;
+        font-family: 'Outfit', sans-serif !important;
+        font-weight: 600 !important;
+        letter-spacing: -0.02em !important;
+    }}
+    h1 {{
+        border-bottom: 2px solid {BRAND_DARK_BLUE} !important;
+        padding-bottom: 0.5rem !important;
+        margin-bottom: 1.5rem !important;
+    }}
+    
+    /* Primary Action Buttons (Main Content) */
+    .stButton > button[data-testid="baseButton-primary"] {{
+        background-color: {BRAND_ORANGE} !important;
+        color: white !important;
+        border-radius: 6px !important;
+        border: none !important;
+        font-weight: 600 !important;
+        padding: 0.5rem 1.25rem !important;
+        box-shadow: 0 2px 8px rgba(244, 126, 32, 0.3) !important;
+        transition: all 0.2s ease !important;
+    }}
+    .stButton > button[data-testid="baseButton-primary"]:hover {{
+        background-color: #d96a12 !important;
+        box-shadow: 0 4px 12px rgba(244, 126, 32, 0.4) !important;
+        transform: translateY(-1px) !important;
+    }}
+    
+    /* Secondary Buttons */
+    .stButton > button[data-testid="baseButton-secondary"] {{
+        background-color: {BRAND_MEDIUM_BLUE} !important;
+        color: white !important;
+        border-radius: 6px !important;
+        border: none !important;
+        font-weight: 500 !important;
+        transition: all 0.2s ease !important;
+    }}
+    .stButton > button[data-testid="baseButton-secondary"]:hover {{
+        background-color: {BRAND_LIGHT_BLUE} !important;
+        color: {BRAND_DARK_BLUE} !important;
+    }}
+    
+    /* Inputs */
+    .stTextInput > div > div > input, 
+    .stSelectbox > div > div,
+    .stDateInput > div > div > input,
+    .stNumberInput > div > div > input {{
+        background-color: #1e293b !important;
+        color: {BRAND_OFF_WHITE} !important;
+        border: 1px solid {BRAND_DARK_BLUE} !important;
+        border-radius: 6px !important;
+        font-family: 'Outfit', sans-serif !important;
+    }}
+    .stTextInput > div > div > input:focus,
+    .stSelectbox > div > div:focus-within,
+    .stDateInput > div > div > input:focus {{
+        border-color: {BRAND_LIGHT_BLUE} !important;
+        box-shadow: 0 0 0 2px rgba(95, 183, 222, 0.2) !important;
+    }}
+    
+    /* Radio */
+    .stRadio > div > div > label {{
+        color: {BRAND_OFF_WHITE} !important;
+    }}
+    
+    /* DataFrames */
+    .stDataFrame {{
+        border: 1px solid {BRAND_DARK_BLUE} !important;
+        border-radius: 8px !important;
+        overflow: hidden !important;
+    }}
+    .stDataFrame th {{
+        background-color: {BRAND_DARK_BLUE} !important;
+        color: white !important;
+        font-family: 'Outfit', sans-serif !important;
+        font-weight: 600 !important;
+    }}
+    .stDataFrame td {{
+        background-color: #1e293b !important;
+        color: {BRAND_OFF_WHITE} !important;
+    }}
+    
+    /* Metrics */
+    [data-testid="stMetric"] {{
+        background: #1e293b !important;
+        border-left: 4px solid {BRAND_LIGHT_BLUE} !important;
+        border-radius: 8px !important;
+        padding: 1rem !important;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.2) !important;
+    }}
+    [data-testid="stMetricLabel"] {{
+        color: {BRAND_LIGHT_GRAY} !important;
+        font-family: 'Outfit', sans-serif !important;
+        font-size: 0.85rem !important;
+    }}
+    [data-testid="stMetricValue"] {{
+        color: {BRAND_OFF_WHITE} !important;
+        font-family: 'Outfit', sans-serif !important;
+        font-weight: 700 !important;
+        font-size: 1.75rem !important;
+    }}
+    [data-testid="stMetricDelta"] {{
+        color: {BRAND_ORANGE} !important;
+    }}
+    
+    /* Expander */
+    .streamlit-expanderHeader {{
+        background-color: #1e293b !important;
+        border: 1px solid {BRAND_DARK_BLUE} !important;
+        border-radius: 6px !important;
+        color: {BRAND_LIGHT_BLUE} !important;
+        font-weight: 600 !important;
+    }}
+    .streamlit-expanderContent {{
+        background-color: #0f172a !important;
+        border: 1px solid {BRAND_DARK_BLUE} !important;
+        border-top: none !important;
+        border-radius: 0 0 6px 6px !important;
+    }}
+    
+    /* Dividers */
+    hr {{
+        border-color: rgba(95, 183, 222, 0.2) !important;
+    }}
+    
+    /* Status indicators */
+    .stSuccess, .stInfo, .stWarning, .stError {{
+        border-radius: 6px !important;
+    }}
+    
+    /* Dialogs / Modals */
+    [data-testid="stDialog"] > div > div {{
+        background-color: #1e293b !important;
+        border: 1px solid {BRAND_DARK_BLUE} !important;
+        border-radius: 12px !important;
+    }}
+    
+    /* Scrollbar */
+    ::-webkit-scrollbar {{
+        width: 8px;
+        height: 8px;
+    }}
+    ::-webkit-scrollbar-track {{
+        background: #0b1120;
+    }}
+    ::-webkit-scrollbar-thumb {{
+        background: {BRAND_DARK_BLUE};
+        border-radius: 4px;
+    }}
+    ::-webkit-scrollbar-thumb:hover {{
+        background: {BRAND_MEDIUM_BLUE};
+    }}
+    
+    /* File Uploader */
+    .stFileUploader > div > div {{
+        background-color: #1e293b !important;
+        border: 2px dashed {BRAND_DARK_BLUE} !important;
+        border-radius: 8px !important;
+    }}
+    .stFileUploader > div > div:hover {{
+        border-color: {BRAND_LIGHT_BLUE} !important;
+    }}
+    
+    /* Checkbox in data editor */
+    .st-emotion-cache-1gulkj5 {{
+        background-color: transparent !important;
+    }}
+    </style>
+    """
+    st.markdown(css, unsafe_allow_html=True)
+
+inject_theme()
+
+# ─── DATABASE ───────────────────────────────────────────────────────────────
 def parse_and_escape_uri(uri: str) -> str:
     if not uri or not uri.startswith('mysql'):
         return uri
@@ -54,8 +363,6 @@ def get_db():
         Table('employees', metadata, Column('ecn', String(50), primary_key=True), Column('data', JSON), Column('created_at', String(10)), Column('updated_at', String(10)), Column('last_upload', String(10)), mysql_engine='InnoDB')
         Table('history', metadata, Column('id', Integer, primary_key=True, autoincrement=True), Column('ecn', String(50), index=True), Column('employee_name', String(200)), Column('field', String(100), index=True), Column('value', String(500)), Column('prev_value', String(500)), Column('start_date', String(10), index=True), Column('end_date', String(10), index=True), Column('source', String(20)), mysql_engine='InnoDB')
         Table('upload_log', metadata, Column('id', Integer, primary_key=True, autoincrement=True), Column('upload_date', String(10), index=True), Column('rows_processed', Integer), Column('inserted', Integer), Column('updated', Integer), Column('skipped_manual', Integer), mysql_engine='InnoDB')
-        Table('history_summary', metadata, Column('ecn', String(50), primary_key=True), Column('employee_name', String(200)), Column('record_count', Integer, default=0), Column('last_updated', String(10)), Column('updated_at', DateTime, default=datetime.now, onupdate=datetime.now), mysql_engine='InnoDB')
-        Table('history_fields', metadata, Column('id', Integer, primary_key=True, autoincrement=True), Column('ecn', String(50), index=True), Column('field_name', String(100), index=True), Column('created_at', DateTime, default=datetime.now), mysql_engine='InnoDB')
         metadata.create_all(engine)
         return engine, metadata
     except Exception as e:
@@ -69,6 +376,7 @@ def get_engine():
 def db_connected():
     return get_engine() is not None
 
+# ─── HELPERS ────────────────────────────────────────────────────────────────
 def safe_str(v):
     if v is None or (isinstance(v, float) and np.isnan(v)): return ''
     if isinstance(v, (datetime, pd.Timestamp)): return v.strftime('%Y-%m-%d')
@@ -87,7 +395,60 @@ def parse_date(v):
     return None
 
 def row_to_doc(row: dict) -> dict:
-    return {k.replace('.', '_'): safe_str(v) for k, v in row.items()}
+    accepted = set(get_all_accepted_columns())
+    return {k.replace('.', '_'): safe_str(v) for k, v in row.items() if k.replace('.', '_') in accepted or k.startswith('_')}
+
+def filter_accepted_columns(df: pd.DataFrame) -> pd.DataFrame:
+    accepted = set(get_all_accepted_columns())
+    keep = [c for c in df.columns if c in accepted or c.startswith('_') or c.startswith('__')]
+    return df[[c for c in keep if c in df.columns]]
+
+def reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
+    ordered = [c for c in DISPLAY_ORDER if c in df.columns]
+    remaining = [c for c in df.columns if c not in ordered]
+    return df[ordered + remaining]
+
+def calculate_aging_bucket(doj_str: str, sep_str: str, fallback_date_str: str = None) -> str:
+    doj = parse_date(doj_str)
+    if not doj: return ''
+    sep = parse_date(sep_str)
+    if sep:
+        end_dt = datetime.strptime(sep, '%Y-%m-%d').date()
+    elif fallback_date_str:
+        try:
+            end_dt = datetime.strptime(str(fallback_date_str), '%Y-%m-%d').date()
+        except Exception:
+            end_dt = date.today()
+    else:
+        end_dt = date.today()
+    start_dt = datetime.strptime(doj, '%Y-%m-%d').date()
+    delta = (end_dt - start_dt).days
+    if delta < 0: return ''
+    if delta <= 30: return '0-30'
+    elif delta <= 60: return '31-60'
+    elif delta <= 90: return '61-90'
+    elif delta <= 180: return '91-180'
+    elif delta <= 365: return '181-1yr'
+    elif delta <= 730: return '1-2yrs'
+    else: return '2yrs+'
+
+def apply_aging_bucket(df: pd.DataFrame, ref_date: date = None, use_date_exported: bool = False) -> pd.DataFrame:
+    if 'DOJ Knack' not in df.columns:
+        return df
+    def compute_row(row):
+        sep = row.get('Date of Separation', '')
+        fallback = row.get('Date Exported') if use_date_exported else None
+        return calculate_aging_bucket(row.get('DOJ Knack', ''), sep, fallback)
+    df['Aging Bucket'] = df.apply(compute_row, axis=1)
+    return df
+
+def apply_active_nulls(df: pd.DataFrame) -> pd.DataFrame:
+    if 'Active/Inactive' in df.columns:
+        mask = df['Active/Inactive'] == 'Active'
+        for col in ['Date of Separation', 'Attrition Type', 'Reason for Attrition']:
+            if col in df.columns:
+                df.loc[mask, col] = ''
+    return df
 
 def load_excel(uploaded_file) -> pd.DataFrame:
     try:
@@ -96,6 +457,15 @@ def load_excel(uploaded_file) -> pd.DataFrame:
         df = pd.read_excel(uploaded_file, sheet_name=sheet, dtype=str)
         df.columns = [str(c).strip() for c in df.columns]
         df = df.fillna('')
+        # Filter to accepted columns only
+        accepted = set(get_all_accepted_columns())
+        keep_cols = [c for c in df.columns if c in accepted]
+        ignored = [c for c in df.columns if c not in accepted]
+        if ignored:
+            st.toast(f'Ignored {len(ignored)} unaccepted columns', icon='⚠️')
+            with st.expander(f'See ignored columns ({len(ignored)})'):
+                st.write(ignored)
+        df = df[keep_cols]
         if 'ECN' in df.columns:
             before = len(df)
             df = df.drop_duplicates(subset=['ECN'], keep='last')
@@ -112,7 +482,7 @@ def df_to_excel_bytes(df: pd.DataFrame, sheet_name='Staffing') -> bytes:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
         wb = writer.book
         ws = writer.sheets[sheet_name]
-        header_fmt = wb.add_format({'bold': True, 'bg_color': '#1f4e79', 'font_color': 'white', 'border': 1})
+        header_fmt = wb.add_format({'bold': True, 'bg_color': BRAND_DARK_BLUE, 'font_color': 'white', 'border': 1})
         for col_num, col_name in enumerate(df.columns):
             ws.write(0, col_num, col_name, header_fmt)
             ws.set_column(col_num, col_num, max(15, len(str(col_name)) + 2))
@@ -131,213 +501,23 @@ def get_effective_dates(row: dict, upload_date: str) -> tuple:
 def generate_template_bytes() -> bytes:
     template_data = {
         'ECN': ['EMP001', 'EMP002'], 'Employee': ['John Doe', 'Jane Smith'],
-        'DOJ Knack': ['2024-01-15', '2024-03-01'], 'Date of Separation': ['', ''],
-        'Effective From': ['', ''], 'Effective To': ['', ''],
         'Client': ['ABC Corp', 'XYZ Inc'], 'Sub-Process': ['Support', 'Billing'],
-        'Supervisor': ['Manager A', 'Manager B'], 'Role': ['Agent', 'Senior Agent'],
-        'Manager': ['Director X', 'Director Y'],
-        'Process Owner': ['Owner 1', 'Owner 2'],
-        'Department': ['Customer Service', 'Finance'], 'Location': ['Manila', 'Cebu'],
-        'Gender': ['Male', 'Female'],
-        'Global ID (GPP)': ['GPP001', 'GPP002'],
-        'Active/Inactive': ['Active', 'Active'], 'CDP Email': ['john.cdp@company.com', 'jane.cdp@company.com'],
-        'EWS Type': ['', ''], 'Driver': ['', ''],
-        'Expected Move Date': ['', ''], 'Overall Location': ['PH', 'PH'],
-        'Attrition Type': ['', ''], 'Reason for Attrition': ['', ''],
-        'Email': ['john@company.com', 'jane@company.com'],
-        'NT Login': ['jdoe', 'jsmith'], 'Structure': ['Ops', 'Ops'],
-        'Billable/Buffer': ['Billable', 'Buffer'],
+        'Supervisor': ['Manager A', 'Manager B'], 'Manager': ['Director X', 'Director Y'],
+        'Role': ['Agent', 'Senior Agent'], 'Process Owner': ['Owner 1', 'Owner 2'],
+        'Billable/Buffer': ['Billable', 'Buffer'], 'DOJ Knack': ['2024-01-15', '2024-03-01'],
+        'Date of Separation': ['', ''], 'Active/Inactive': ['Active', 'Active'],
+        'Email': ['john@company.com', 'jane@company.com'], 'NT Login': ['jdoe', 'jsmith'],
+        'Structure': ['Ops', 'Ops'], 'Department': ['Customer Service', 'Finance'],
+        'Location': ['Manila', 'Cebu'], 'Gender': ['Male', 'Female'],
+        'Global ID (GPP)': ['GPP001', 'GPP002'], 'Attrition Type': ['', ''],
+        'Reason for Attrition': ['', ''], 'CDP Email': ['john.cdp@company.com', 'jane.cdp@company.com'],
+        'Overall Location': ['PH', 'PH'],
     }
     return df_to_excel_bytes(pd.DataFrame(template_data), sheet_name='Consolidated Staffing')
 
-# ─── COLUMN MANAGEMENT ──────────────────────────────────────────────────────
-DROPPED_COLS = {
-    'DOJ Project', 'Aging Knack', 'Aging Project', 'BufferAgent', 'Column80',
-    'Source.Name', 'Sr No', 'Date', 'Column98', 'Start of the Month',
-    'End of the Month', 'Start of Week', 'Lookup', 'Shift Timing',
-    'Allocated Seats', 'Seat Number', 'Client Approved Billable',
-    'Tagging', 'Role Tagging', 'Specialty',
-    'Source_Name', 'Expected Move Date', 'Driver'
-}
-
-DISPLAY_ORDER = [
-    'ECN', 'Employee', 'Client', 'Sub-Process', 'Supervisor',
-    'Manager', 'Role', 'Process Owner', 'Billable/Buffer', 'DOJ Knack',
-    'Date of Separation', 'Active/Inactive', 'Email', 'NT Login', 'Structure',
-    'Department', 'Aging Bucket', 'Location', 'Gender', 'Global ID (GPP)',
-    'Attrition Type', 'Reason for Attrition', 'CDP Email', 'EWS Type',
-    'Driver', 'Expected Move Date', 'Overall Location'
-]
-
-def drop_unwanted_columns(df: pd.DataFrame) -> pd.DataFrame:
-    cols_to_drop = [c for c in DROPPED_COLS if c in df.columns]
-    if cols_to_drop:
-        df = df.drop(columns=cols_to_drop, errors='ignore')
-    return df
-
-def reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
-    ordered = [c for c in DISPLAY_ORDER if c in df.columns]
-    remaining = [c for c in df.columns if c not in ordered]
-    return df[ordered + remaining]
-
-def calculate_aging_bucket(doj_str: str, sep_str: str, ref_date: date) -> str:
-    doj = parse_date(doj_str)
-    sep = parse_date(sep_str)
-    if not doj: return ''
-    end_dt = datetime.strptime(sep, '%Y-%m-%d').date() if sep else ref_date
-    start_dt = datetime.strptime(doj, '%Y-%m-%d').date()
-    delta = (end_dt - start_dt).days
-    if delta <= 30: return '0-30'
-    elif delta <= 60: return '31-60'
-    elif delta <= 90: return '61-90'
-    elif delta <= 180: return '91-180'
-    elif delta <= 365: return '181-1yr'
-    elif delta <= 730: return '1-2yrs'
-    else: return '2yrs+'
-
-def apply_aging_bucket(df: pd.DataFrame, ref_date: date = None) -> pd.DataFrame:
-    if ref_date is None: ref_date = date.today()
-    if 'DOJ Knack' in df.columns:
-        df['Aging Bucket'] = df.apply(
-            lambda r: calculate_aging_bucket(r.get('DOJ Knack', ''), r.get('Date of Separation', ''), ref_date),
-            axis=1
-        )
-    return df
-
-def apply_active_nulls(df: pd.DataFrame, query_date: str = None) -> pd.DataFrame:
-    if query_date and 'Active/Inactive' in df.columns:
-        mask = df['Active/Inactive'] == 'Active'
-        if 'Date of Separation' in df.columns:
-            df.loc[mask, 'Date of Separation'] = ''
-        if 'Attrition Type' in df.columns:
-            df.loc[mask, 'Attrition Type'] = ''
-        if 'Reason for Attrition' in df.columns:
-            df.loc[mask, 'Reason for Attrition'] = ''
-    return df
 BATCH_SIZE = 1000
 
-def hide_date_exported(df: pd.DataFrame) -> pd.DataFrame:
-    if 'Date Exported' in df.columns:
-        df = df.drop(columns=['Date Exported'], errors='ignore')
-    return df
-
-
-# ─── NORMALIZED HISTORY FUNCTIONS ──────────────────────────────────────────
-
-@st.cache_data(ttl=60, show_spinner=False)
-def get_history_summary(search: str = '', limit: int = 500) -> pd.DataFrame:
-    engine = get_engine()
-    if engine is None: return pd.DataFrame()
-    query = text("""
-        SELECT 
-            hs.ecn,
-            hs.employee_name,
-            hs.record_count,
-            hs.last_updated,
-            GROUP_CONCAT(DISTINCT hf.field_name ORDER BY hf.field_name SEPARATOR ', ') as fields_changed
-        FROM history_summary hs
-        LEFT JOIN history_fields hf ON hs.ecn = hf.ecn
-        WHERE (:search = '' OR hs.ecn LIKE :search OR hs.employee_name LIKE :search)
-        GROUP BY hs.ecn, hs.employee_name, hs.record_count, hs.last_updated
-        ORDER BY hs.last_updated DESC
-        LIMIT :limit
-    """)
-    with engine.connect() as conn:
-        result = conn.execute(query, {'search': f'%{search}%' if search else '', 'limit': limit}).fetchall()
-    if not result: return pd.DataFrame()
-    return pd.DataFrame(result, columns=['ECN', 'Employee', 'Records', 'Last Updated', 'Fields Changed'])
-
-def get_fields_for_ecn(ecn: str) -> list:
-    engine = get_engine()
-    if engine is None: return []
-    query = text('SELECT field_name FROM history_fields WHERE ecn = :ecn ORDER BY field_name')
-    with engine.connect() as conn:
-        result = conn.execute(query, {'ecn': ecn}).fetchall()
-    return [r[0] for r in result]
-
-def get_ecns_by_field(field_name: str, limit: int = 500) -> pd.DataFrame:
-    engine = get_engine()
-    if engine is None: return pd.DataFrame()
-    query = text("""
-        SELECT hs.ecn, hs.employee_name, hs.record_count, hs.last_updated
-        FROM history_summary hs
-        INNER JOIN history_fields hf ON hs.ecn = hf.ecn
-        WHERE hf.field_name = :field_name
-        ORDER BY hs.last_updated DESC
-        LIMIT :limit
-    """)
-    with engine.connect() as conn:
-        result = conn.execute(query, {'field_name': field_name, 'limit': limit}).fetchall()
-    if not result: return pd.DataFrame()
-    return pd.DataFrame(result, columns=['ECN', 'Employee', 'Records', 'Last Updated'])
-
-def get_field_change_counts() -> pd.DataFrame:
-    engine = get_engine()
-    if engine is None: return pd.DataFrame()
-    query = text("""
-        SELECT 
-            field_name,
-            COUNT(DISTINCT ecn) as employee_count,
-            COUNT(*) as total_changes
-        FROM history_fields
-        GROUP BY field_name
-        ORDER BY total_changes DESC
-    """)
-    with engine.connect() as conn:
-        result = conn.execute(query).fetchall()
-    if not result: return pd.DataFrame()
-    return pd.DataFrame(result, columns=['Field', 'Employees', 'Total Changes'])
-
-def refresh_history_summary():
-    engine = get_engine()
-    if engine is None: return
-    try:
-        with engine.connect() as conn:
-            # Rebuild summary table
-            conn.execute(text("""
-                INSERT INTO history_summary (ecn, employee_name, record_count, last_updated)
-                SELECT 
-                    ecn,
-                    MAX(employee_name) as employee_name,
-                    COUNT(*) as record_count,
-                    MAX(start_date) as last_updated
-                FROM history
-                GROUP BY ecn
-                ON DUPLICATE KEY UPDATE
-                    employee_name = VALUES(employee_name),
-                    record_count = VALUES(record_count),
-                    last_updated = VALUES(last_updated)
-            """))
-            # Rebuild fields table
-            conn.execute(text('DELETE FROM history_fields'))
-            conn.execute(text("""
-                INSERT INTO history_fields (ecn, field_name)
-                SELECT DISTINCT ecn, field
-                FROM history
-            """))
-            conn.commit()
-            st.cache_data.clear()
-    except Exception as e:
-        st.error(f'Error refreshing summary: {e}')
-
-def update_history_summary_on_change(ecn: str, employee_name: str, start_date: str):
-    engine = get_engine()
-    if engine is None: return
-    try:
-        with engine.connect() as conn:
-            # Upsert summary
-            conn.execute(text("""
-                INSERT INTO history_summary (ecn, employee_name, record_count, last_updated)
-                VALUES (:ecn, :emp, 1, :date)
-                ON DUPLICATE KEY UPDATE
-                    employee_name = VALUES(employee_name),
-                    record_count = record_count + 1,
-                    last_updated = GREATEST(last_updated, VALUES(last_updated))
-            """), {'ecn': ecn, 'emp': employee_name, 'date': start_date})
-            conn.commit()
-    except Exception:
-        pass
-
+# ─── DATABASE OPERATIONS ────────────────────────────────────────────────────
 @st.cache_data(ttl=60, show_spinner=False)
 def get_all_employees_df() -> pd.DataFrame:
     engine = get_engine()
@@ -354,8 +534,11 @@ def get_all_employees_df() -> pd.DataFrame:
         data['_last_upload'] = row['last_upload']
         records.append(data)
     df = pd.DataFrame(records)
-    df = drop_unwanted_columns(df)
+    # Filter out meta records
+    df = df[~df['ECN'].astype(str).str.startswith('_')]
+    df = filter_accepted_columns(df)
     df = apply_aging_bucket(df)
+    df = apply_active_nulls(df)
     df = reorder_columns(df)
     return df
 
@@ -443,6 +626,7 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_employees_at_date(query_date: str) -> pd.DataFrame:
+    engine = get_engine()
     df = get_all_employees_df()
     if df.empty: return df
     if 'DOJ Knack' in df.columns:
@@ -462,10 +646,10 @@ def get_employees_at_date(query_date: str) -> pd.DataFrame:
             if key not in overrides: overrides[key] = value
         for (ecn, field), val in overrides.items():
             if field in df.columns: df.loc[df['ECN'] == ecn, field] = val
-    internal = [c for c in df.columns if c.startswith('_')]
-    df = drop_unwanted_columns(df)
-    df = apply_aging_bucket(df, datetime.strptime(query_date, "%Y-%m-%d").date())
-    df = apply_active_nulls(df, query_date)
+    ref = datetime.strptime(query_date, "%Y-%m-%d").date()
+    df = filter_accepted_columns(df)
+    df = apply_aging_bucket(df, ref_date=ref)
+    df = apply_active_nulls(df)
     df = reorder_columns(df)
     internal = [c for c in df.columns if c.startswith("_")]
     return df.drop(columns=internal, errors="ignore")
@@ -554,62 +738,69 @@ def get_db_stats():
     engine = get_engine()
     if engine is None: return None, None, None
     with engine.connect() as conn:
-        emp_count = conn.execute(text('SELECT COUNT(*) FROM employees')).scalar()
-        active_count = conn.execute(text("SELECT COUNT(*) FROM employees WHERE data->>'$.\"Active/Inactive\"' = 'Active'")).scalar()
+        emp_count = conn.execute(text("SELECT COUNT(*) FROM employees WHERE LEFT(ecn, 1) != '_'")).scalar()
+        active_count = conn.execute(text("SELECT COUNT(*) FROM employees WHERE LEFT(ecn, 1) != '_' AND data->>'$.\"Active/Inactive\"' = 'Active'")).scalar()
         hist_count = conn.execute(text('SELECT COUNT(*) FROM history')).scalar()
     return emp_count, active_count, hist_count
 
+# ─── SIDEBAR NAVIGATION ─────────────────────────────────────────────────────
+pages = {
+    'upload': {'icon': '📤', 'label': 'Upload & Sync'},
+    'employees': {'icon': '👤', 'label': 'Employees'},
+    'snapshot': {'icon': '📅', 'label': 'Snapshot'},
+    'export': {'icon': '📊', 'label': 'Export'},
+    'history': {'icon': '📜', 'label': 'History'},
+    'dbtools': {'icon': '🛠️', 'label': 'DB Tools'}
+}
+
+if 'nav_page' not in st.session_state:
+    st.session_state.nav_page = 'upload'
+
 with st.sidebar:
-    st.image('https://kimi-web-img.moonshot.cn/img/knackrcm.com/26ef9a05ac06e2c7d058a5cafefa681569032b17.png', width=80)
-    st.title('Knack RCM')
-    st.markdown("""
-    <style>
-    .stApp { background-color: #0f172a; color: #e2e8f0; }
-    .stSidebar { background-color: #1a3a5c !important; }
-    .stSidebar .stMarkdown { color: white !important; }
-    .stSidebar [data-testid='stRadio'] label { color: white !important; font-weight: 500; }
-    .stSidebar [data-testid='stRadio'] label:hover { color: #5ba8d8 !important; }
-    .stButton>button { background-color: #2d6da8; color: white; border-radius: 6px; border: none; }
-    .stButton>button:hover { background-color: #5ba8d8; color: white; }
-    .stButton>button[kind='primary'] { background-color: #2d6da8; }
-    h1, h2, h3 { color: #5ba8d8 !important; font-family: 'Segoe UI', sans-serif; }
-    .stDataFrame { border: 1px solid #334155; border-radius: 8px; }
-    .stDataFrame td { color: #e2e8f0 !important; }
-    .stDataFrame th { background-color: #1e293b !important; color: #5ba8d8 !important; }
-    .stMetric { background: #1e293b; padding: 16px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.3); border: 1px solid #334155; }
-    .stMetric label { color: #94a3b8 !important; }
-    .stMetric div { color: #e2e8f0 !important; }
-    .stTextInput>div>div>input { background-color: #1e293b; color: #e2e8f0; border: 1px solid #334155; }
-    .stSelectbox>div>div>div { background-color: #1e293b; color: #e2e8f0; border: 1px solid #334155; }
-    .stDateInput>div>div>input { background-color: #1e293b; color: #e2e8f0; border: 1px solid #334155; }
-    .stExpander { background-color: #1e293b; border: 1px solid #334155; border-radius: 8px; }
-    .stInfo { background-color: #1e293b; border-left-color: #2d6da8; }
-    .stSuccess { background-color: #1e293b; border-left-color: #22c55e; }
-    .stWarning { background-color: #1e293b; border-left-color: #f59e0b; }
-    .stError { background-color: #1e293b; border-left-color: #ef4444; }
-    .stSpinner > div { border-top-color: #5ba8d8 !important; }
-    </style>
-    """, unsafe_allow_html=True)
-    st.divider()
+    # Logo + Title side by side
+    hc1, hc2 = st.columns([1, 3])
+    with hc1:
+        st.image('https://kimi-web-img.moonshot.cn/img/knackrcm.com/26ef9a05ac06e2c7d058a5cafefa681569032b17.png', width=60)
+    with hc2:
+        st.markdown(f"<h2 style='color:{BRAND_LIGHT_BLUE}; margin:0; padding-top:6px; font-family:Outfit,sans-serif; font-weight:700; letter-spacing:-0.5px;'>Knack RCM</h2>", unsafe_allow_html=True)
+    
+    st.markdown(f"<hr style='border-color:rgba(95,183,222,0.25); margin:1.2rem 0;'>", unsafe_allow_html=True)
+    
+    for key, val in pages.items():
+        btn_type = 'primary' if st.session_state.nav_page == key else 'secondary'
+        if st.button(f"{val['icon']} {val['label']}", key=f'nav_{key}', use_container_width=True, type=btn_type):
+            st.session_state.nav_page = key
+            st.rerun()
+    
+    st.markdown(f"<hr style='border-color:rgba(95,183,222,0.25); margin:1.2rem 0;'>", unsafe_allow_html=True)
+    
     if db_connected():
         st.success('✅ TiDB Connected')
     else:
         err = st.session_state.get('_db_err', '')
         st.error(f'❌ {err[:120]}') if err else st.warning('⚠️ No TiDB URI configured')
-    st.divider()
+    
     if st.button('🔄 Refresh Data', use_container_width=True):
         st.cache_data.clear()
         st.toast('Cache cleared!', icon='✅')
         st.rerun()
-    st.divider()
-    page = st.radio('Menu', ['📤 Upload & Sync', '👤 Employees', '📅 Snapshot', '📊 Export', '📜 History', '🛠️ DB Tools'])
 
-if page == '📤 Upload & Sync':
+page = st.session_state.nav_page
+
+# ─── PAGE: UPLOAD & SYNC ────────────────────────────────────────────────────
+if page == 'upload':
     st.title('📤 Data Upload & Sync')
     if not db_connected(): st.error('Please configure a valid TiDB URI in Streamlit Secrets first.'); st.stop()
+    
     st.subheader('📋 Template')
-    st.download_button(label='⬇️ Download Excel Template', data=generate_template_bytes(), file_name='staffing_template.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    st.download_button(
+        label='⬇️ Download Excel Template',
+        data=generate_template_bytes(),
+        file_name='staffing_template.xlsx',
+        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
     st.divider()
+    
     col1, col2 = st.columns([2, 1])
     with col1: uploaded = st.file_uploader('Choose Excel file (.xlsx)', type=['xlsx'])
     with col2:
@@ -617,66 +808,82 @@ if page == '📤 Upload & Sync':
         st.markdown('- **Required:** `ECN` (unique employee ID)')
         st.markdown('- **Optional:** `Effective From`, `Effective To`')
         st.markdown('- **Recommended:** `DOJ Knack`, `Date of Separation`')
-        st.markdown('- Any other columns accepted automatically')
+        st.markdown('- Only accepted columns will be processed')
         st.markdown('- In-app edits are protected from Excel overwrites')
+    
     if uploaded:
         with st.spinner('Reading file...'): df = load_excel(uploaded)
         if df.empty: st.error('Could not read the Excel file.'); st.stop()
         st.success(f'✅ **{len(df):,} rows**, **{len(df.columns)} columns**')
-        st.caption(f'Columns: {', '.join(df.columns[:12])}{'...' if len(df.columns) > 12 else ''}')
-        with st.expander('Preview (first 10 rows)'): st.dataframe(df.head(10), use_container_width=True)
-        # Detect new columns
-        existing_cols = set(get_all_employees_df().columns) if db_connected() else set()
-        new_cols = [c for c in df.columns if c not in existing_cols and c not in DROPPED_COLS and not c.startswith('_')]
-        if new_cols:
-            st.warning(f'⚠️ Unapproved columns detected: {', '.join(new_cols)}')
-            st.markdown('**These columns are NOT in the database yet.** Approve them to include in future uploads.')
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button('✅ Approve & Add Columns', key='approve_cols', type='primary'):
-                    engine = get_engine()
-                    if engine:
-                        try:
-                            with engine.connect() as conn:
-                                for col in new_cols:
-                                    conn.execute(text('INSERT IGNORE INTO employees (ecn, data, created_at, updated_at, last_upload) VALUES (:ecn, :data, :d, :d, :d)'), {'ecn': '_COL_' + col, 'data': json.dumps({'col_name': col, 'approved': True}), 'd': '2000-01-01'})
-                                conn.commit()
-                            st.cache_data.clear()
-                            st.success(f'✅ {len(new_cols)} column(s) approved and added!')
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f'Error saving columns: {e}')
-            with c2:
-                if st.button('❌ Ignore (Skip These Columns)', key='ignore_cols'):
-                    st.session_state['_ignored_cols'] = st.session_state.get('_ignored_cols', []) + new_cols
-                    st.info('Columns ignored for this session.')
-                    st.rerun()
-            st.divider()
+        st.caption(f'Columns: {", ".join(df.columns[:12])}{"..." if len(df.columns) > 12 else ""}')
+        
+        # Preview with calculated Aging Bucket
+        preview_df = df.copy()
+        preview_df = apply_aging_bucket(preview_df)
+        preview_df = apply_active_nulls(preview_df)
+        preview_df = reorder_columns(preview_df)
+        with st.expander('Preview (first 10 rows)'):
+            st.dataframe(preview_df.head(10), use_container_width=True, hide_index=True)
+        
         if st.button('🚀 Sync to Database', type='primary'):
-            # Save any pending new columns
-            pending = st.session_state.pop('_pending_new_cols', None)
-            if pending:
-                engine = get_engine()
-                if engine:
-                    try:
-                        with engine.connect() as conn:
-                            for col in pending:
-                                conn.execute(text('INSERT IGNORE INTO employees (ecn, data, created_at, updated_at, last_upload) VALUES (:ecn, :data, :d, :d, :d)'), {'ecn': '_COL_' + col, 'data': json.dumps({'col_name': col}), 'd': '2000-01-01'})
-                            conn.commit()
-                    except Exception as e: st.warning(f'Could not save column metadata: {e}')
             today_str = date.today().isoformat(); progress = st.progress(0, text='Preparing...')
-            with st.spinner('Writing to TiDB...'): inserted, updated, err = upsert_employees(df, today_str, progress_bar=progress)
+            with st.spinner('Writing to TiDB...'):
+                inserted, updated, err = upsert_employees(df, today_str, progress_bar=progress)
             if err: st.error(err)
             else:
                 emp_count, _, _ = get_db_stats()
                 st.success(f'✅ Sync complete!\n- **{inserted}** new employees added\n- **{updated}** existing employees updated\n- **{emp_count:,}** total employees in DB')
-    st.divider(); st.subheader('📊 Database Stats')
+    
+    # Column Management Section
+    st.divider()
+    st.subheader('🛠️ Manage Accepted Columns')
+    st.caption('Core columns are always accepted. Add custom columns to accept new fields from uploads.')
+    
+    with st.expander('📋 View Core Columns'):
+        st.write(CORE_COLS)
+    
+    custom_cols = get_custom_columns()
+    if custom_cols:
+        st.markdown('**Custom Columns:**')
+        ccols = st.columns(min(4, len(custom_cols)))
+        for i, col in enumerate(custom_cols):
+            with ccols[i % len(ccols)]:
+                c1, c2 = st.columns([4, 1])
+                with c1:
+                    st.markdown(f"<div style='background:#1e293b;padding:6px 10px;border-radius:4px;border-left:3px solid {BRAND_LIGHT_BLUE};font-size:0.9rem;'>{col}</div>", unsafe_allow_html=True)
+                with c2:
+                    if st.button('🗑️', key=f'rem_col_{col}', help=f'Remove {col}'):
+                        remove_custom_column(col)
+                        st.rerun()
+    
+    acol1, acol2 = st.columns([3, 1])
+    with acol1:
+        new_col = st.text_input('New column name', key='new_col_input', placeholder='e.g. Shift Timing')
+    with acol2:
+        st.write('')
+        st.write('')
+        if st.button('➕ Add Column', type='primary') and new_col.strip():
+            clean_col = new_col.strip()
+            if clean_col in CORE_COLS:
+                st.warning('This is already a core column.')
+            elif clean_col in custom_cols:
+                st.warning('Column already added.')
+            else:
+                add_custom_column(clean_col)
+                st.success(f'Added `{clean_col}`')
+                st.rerun()
+    
+    st.divider()
+    st.subheader('📊 Database Stats')
     emp_count, active_count, hist_count = get_db_stats()
     if emp_count is not None:
         c1, c2, c3 = st.columns(3)
-        c1.metric('Total Employees', f'{emp_count:,}'); c2.metric('Active', f'{active_count:,}'); c3.metric('History Records', f'{hist_count:,}')
+        c1.metric('Total Employees', f'{emp_count:,}')
+        c2.metric('Active', f'{active_count:,}')
+        c3.metric('History Records', f'{hist_count:,}')
 
-elif page == '👤 Employees':
+# ─── PAGE: EMPLOYEES ────────────────────────────────────────────────────────
+elif page == 'employees':
     st.title('👤 Employee Management')
     engine = get_engine()
     if engine is None: st.error('Connect TiDB first.'); st.stop()
@@ -685,7 +892,7 @@ elif page == '👤 Employees':
     employees_df = get_all_employees_df()
     if employees_df.empty: st.warning('No employees found.'); st.stop()
 
-    # ─── FILTERS ─────────────────────────────────────────────────────────────
+    # Filters
     st.markdown('**Filters**')
     filter_cols = st.columns(4)
     with filter_cols[0]:
@@ -736,10 +943,7 @@ elif page == '👤 Employees':
 
     if employees_df.empty: st.warning('No employees match your filters.'); st.stop()
 
-    employees_df = drop_unwanted_columns(employees_df)
-    employees_df = apply_aging_bucket(employees_df)
     employees_df = reorder_columns(employees_df)
-    employees_df = hide_date_exported(employees_df)
     display_cols = [c for c in DISPLAY_ORDER if c in employees_df.columns][:10]
     display_cols = [c for c in display_cols if c in employees_df.columns]
     st.markdown(f'**{len(employees_df)} employees found**')
@@ -804,7 +1008,7 @@ elif page == '👤 Employees':
             @st.dialog(f'🔧 Bulk Edit {len(selected_indices)} Employees', width='large')
             def bulk_edit_modal():
                 emps = [employees_df.loc[i].to_dict() for i in selected_indices]; ecns = [e['ECN'] for e in emps]; names = [e.get('Employee', e['ECN']) for e in emps]
-                st.caption(f'Editing: {', '.join(names[:5])}{'...' if len(names) > 5 else ''}')
+                st.caption(f'Editing: {", ".join(names[:5])}{"..." if len(names) > 5 else ""}')
                 c1, c2 = st.columns(2)
                 with c1: eff_from = st.date_input('Effective From', value=date.today(), key='be_from')
                 with c2: eff_to = st.date_input('Effective To (blank = ongoing)', value=None, key='be_to')
@@ -840,7 +1044,9 @@ elif page == '👤 Employees':
                 with c2:
                     if st.button('❌ Cancel', key='be_cancel'): st.session_state['show_bulk_edit'] = False; st.rerun()
             bulk_edit_modal()
-elif page == '📅 Snapshot':
+
+# ─── PAGE: SNAPSHOT ─────────────────────────────────────────────────────────
+elif page == 'snapshot':
     st.title('📅 Historical Snapshot')
     st.markdown('View staffing data **as it was on any specific date**.')
     if not db_connected(): st.error('Connect TiDB first.'); st.stop()
@@ -852,7 +1058,6 @@ elif page == '📅 Snapshot':
     with c3: filter_status = st.selectbox('Status', ['All', 'Active', 'Inactive', 'LOA', 'Maternity', 'Suspended'])
     if st.button('📸 Load Snapshot', type='primary'):
         with st.spinner(f'Building snapshot for {snap_str}...'): df = get_employees_at_date(snap_str)
-        df = hide_date_exported(df)
         if df.empty: st.warning('No data found.')
         else:
             if filter_client and 'Client' in df.columns: df = df[df['Client'].str.contains(filter_client, case=False, na=False)]
@@ -867,9 +1072,15 @@ elif page == '📅 Snapshot':
             if 'Active/Inactive' in df.columns: m4.metric('Active', len(df[df['Active/Inactive'] == 'Active']))
             display_cols = [c for c in DISPLAY_ORDER if c in df.columns]
             st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
-            st.download_button(label=f'⬇️ Download Snapshot ({snap_str})', data=df_to_excel_bytes(df, sheet_name=f'Snapshot_{snap_str}'), file_name=f'staffing_snapshot_{snap_str}.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            st.download_button(
+                label=f'⬇️ Download Snapshot ({snap_str})',
+                data=df_to_excel_bytes(df, sheet_name=f'Snapshot_{snap_str}'),
+                file_name=f'staffing_snapshot_{snap_str}.xlsx',
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            )
 
-elif page == '📊 Export':
+# ─── PAGE: EXPORT ───────────────────────────────────────────────────────────
+elif page == 'export':
     st.title('📊 Data Export')
     st.markdown('Export staffing data for any time range. **Ultra-fast** — pre-computes everything in-memory.')
     if not db_connected(): st.error('Connect TiDB first.'); st.stop()
@@ -949,11 +1160,12 @@ elif page == '📊 Export':
             df_day = df_day.drop(columns=[c for c in df_day.columns if c.startswith('__')], errors='ignore')
             if filter_active and 'Active/Inactive' in df_day.columns: df_day = df_day[df_day['Active/Inactive'] == 'Active']
             if filter_client2 and 'Client' in df_day.columns: df_day = df_day[df_day['Client'].str.contains(filter_client2, case=False, na=False)]
-            df_day = drop_unwanted_columns(df_day)
-            df_day = apply_aging_bucket(df_day, datetime.strptime(d_str, "%Y-%m-%d").date())
-            df_day = apply_active_nulls(df_day, d_str)
+            df_day = filter_accepted_columns(df_day)
+            df_day['Date Exported'] = d_str
+            df_day = apply_aging_bucket(df_day, use_date_exported=True)
+            df_day = apply_active_nulls(df_day)
             df_day = reorder_columns(df_day)
-            if not df_day.empty: df_day['Date Exported'] = d_str; all_dfs.append(df_day)
+            if not df_day.empty: all_dfs.append(df_day)
             if i % 50 == 0 or i == len(dates) - 1: status.info(f'⏳ Processed {i + 1}/{len(dates)} days...')
         if not all_dfs: st.warning('No data found for the selected range.'); st.stop()
         if export_mode.startswith('Single'):
@@ -961,30 +1173,42 @@ elif page == '📊 Export':
             cols = ['Date Exported'] + [c for c in combined.columns if c != 'Date Exported']
             combined = combined[cols]
             status.success(f'✅ {len(combined):,} rows across {len(all_dfs)} days')
-            st.dataframe(combined.head(20), use_container_width=True)
-            st.download_button(f'⬇️ Download {exp_type} Export', data=df_to_excel_bytes(combined, sheet_name='Staffing Export'), file_name=f'staffing_{label}_single_sheet.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            st.dataframe(combined.head(20), use_container_width=True, hide_index=True)
+            st.download_button(
+                f'⬇️ Download {exp_type} Export',
+                data=df_to_excel_bytes(combined, sheet_name='Staffing Export'),
+                file_name=f'staffing_{label}_single_sheet.xlsx',
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            )
         else:
             if len(dates) > 31: st.warning('One sheet per day mode is limited to 31 days.'); st.stop()
             buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
-                wb = writer.book; header_fmt = wb.add_format({'bold': True, 'bg_color': '#1f4e79', 'font_color': 'white'})
+                wb = writer.book; header_fmt = wb.add_format({'bold': True, 'bg_color': BRAND_DARK_BLUE, 'font_color': 'white'})
                 for i, df_day in enumerate(all_dfs):
                     d_str = dates[i]; sheet = d_str.replace('-', '')[-6:]
                     df_day.to_excel(writer, index=False, sheet_name=sheet)
                     ws = writer.sheets[sheet]
                     for col_num, col_name in enumerate(df_day.columns): ws.write(0, col_num, col_name, header_fmt)
             status.success(f'✅ {len(all_dfs)} daily sheets generated!')
-            st.download_button('⬇️ Download Daily Export', data=buf.getvalue(), file_name=f'staffing_{label}_daily.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            st.download_button(
+                '⬇️ Download Daily Export',
+                data=buf.getvalue(),
+                file_name=f'staffing_{label}_daily.xlsx',
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            )
 
-elif page == '📜 History':
+# ─── PAGE: HISTORY ──────────────────────────────────────────────────────────
+elif page == 'history':
     st.title('📜 Change History')
     st.markdown('One row per employee. Click to view, edit, or delete their history records in a modal.')
     if not db_connected(): st.error('Connect TiDB first.'); st.stop()
     engine = get_engine()
-    if field_filter != 'All Fields':
-        agg_df = get_ecns_by_field(field_filter)
-    else:
-        agg_df = get_history_summary(search)
+    search = st.text_input('🔍 Search by ECN or Employee name', placeholder='e.g. EMP001 or John Doe')
+    query = text("SELECT ecn, MAX(employee_name) as employee_name, COUNT(*) as record_count, MAX(start_date) as last_updated, GROUP_CONCAT(DISTINCT field ORDER BY field SEPARATOR ', ') as fields_changed FROM history WHERE (:search = '' OR ecn LIKE :search OR employee_name LIKE :search) GROUP BY ecn ORDER BY last_updated DESC LIMIT 500")
+    with engine.connect() as conn: agg_results = conn.execute(query, {'search': f'%{search}%' if search else ''}).fetchall()
+    if not agg_results: st.info('No history records found.'); st.stop()
+    agg_df = pd.DataFrame(agg_results, columns=['ECN', 'Employee', 'Records', 'Last Updated', 'Fields Changed'])
     st.markdown(f'**{len(agg_df)} employees with history**')
     selected = st.dataframe(agg_df, use_container_width=True, hide_index=True, on_select='rerun', selection_mode='single-row')
     if selected and selected.selection.rows:
@@ -992,7 +1216,6 @@ elif page == '📜 History':
         @st.dialog(f'📋 History for {emp_name or ecn}', width='large')
         def history_modal():
             hist_df = get_employee_history(ecn)
-            hist_df = hide_date_exported(hist_df)
             if hist_df.empty: st.info('No detailed history found.'); return
             for _, row in hist_df.iterrows():
                 with st.container(border=True):
@@ -1036,22 +1259,12 @@ elif page == '📜 History':
                                     pass
         history_modal()
     st.divider()
-    st.divider()
-    st.subheader('📊 Field Change Analytics')
-    field_stats = get_field_change_counts()
-    if not field_stats.empty:
-        c1, c2 = st.columns(2)
-        with c1:
-            st.bar_chart(field_stats.set_index('Field')['Total Changes'], use_container_width=True)
-        with c2:
-            st.dataframe(field_stats, use_container_width=True, hide_index=True)
-    else:
-        st.info('No field change data available.')
-
     if st.button('🧹 Remove Redundant Records (value == prev_value)'):
         with st.spinner('Cleaning...'): deleted = compact_history()
         st.success(f'Removed **{deleted}** redundant records')
-elif page == '🛠️ DB Tools':
+
+# ─── PAGE: DB TOOLS ─────────────────────────────────────────────────────────
+elif page == 'dbtools':
     st.title('🛠️ Database Maintenance')
     if not db_connected(): st.error('Connect TiDB first.'); st.stop()
     c1, c2 = st.columns(2)
@@ -1060,8 +1273,6 @@ elif page == '🛠️ DB Tools':
         try:
             emp_count, active_count, hist_count = get_db_stats()
             st.metric('Total Employees', f'{emp_count:,}'); st.metric('Active', f'{active_count:,}'); st.metric('History Records', f'{hist_count:,}')
-            st.metric('History Summary', f'{conn.execute(text("SELECT COUNT(*) FROM history_summary")).scalar():,}')
-            st.metric('Field Records', f'{conn.execute(text("SELECT COUNT(*) FROM history_fields")).scalar():,}')
         except Exception as e: st.error(f'Could not fetch stats: {e}')
     with c2:
         st.subheader('Cleanup'); st.markdown('Remove history entries where `value == prev_value` (no actual change).')
