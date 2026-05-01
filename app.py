@@ -1942,7 +1942,7 @@ elif page == 'history':
     params = {}
 
     if search:
-        where_clauses.append("(ecn LIKE :s OR COALESCE(employee_name, '') LIKE :s)")
+        where_clauses.append("(ecn LIKE :s OR employee_name LIKE :s)")
         params['s'] = f'%{search}%'
     if filter_field != 'All':
         where_clauses.append("field = :f")
