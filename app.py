@@ -54,6 +54,8 @@ def get_db():
         Table('employees', metadata, Column('ecn', String(50), primary_key=True), Column('data', JSON), Column('created_at', String(10)), Column('updated_at', String(10)), Column('last_upload', String(10)), mysql_engine='InnoDB')
         Table('history', metadata, Column('id', Integer, primary_key=True, autoincrement=True), Column('ecn', String(50), index=True), Column('employee_name', String(200)), Column('field', String(100), index=True), Column('value', String(500)), Column('prev_value', String(500)), Column('start_date', String(10), index=True), Column('end_date', String(10), index=True), Column('source', String(20)), mysql_engine='InnoDB')
         Table('upload_log', metadata, Column('id', Integer, primary_key=True, autoincrement=True), Column('upload_date', String(10), index=True), Column('rows_processed', Integer), Column('inserted', Integer), Column('updated', Integer), Column('skipped_manual', Integer), mysql_engine='InnoDB')
+        Table('history_summary', metadata, Column('ecn', String(50), primary_key=True), Column('employee_name', String(200)), Column('record_count', Integer, default=0), Column('last_updated', String(10)), Column('updated_at', DateTime, default=datetime.now, onupdate=datetime.now), mysql_engine='InnoDB')
+        Table('history_fields', metadata, Column('id', Integer, primary_key=True, autoincrement=True), Column('ecn', String(50), index=True), Column('field_name', String(100), index=True), Column('created_at', DateTime, default=datetime.now), mysql_engine='InnoDB')
         metadata.create_all(engine)
         return engine, metadata
     except Exception as e:
@@ -218,6 +220,123 @@ def hide_date_exported(df: pd.DataFrame) -> pd.DataFrame:
     if 'Date Exported' in df.columns:
         df = df.drop(columns=['Date Exported'], errors='ignore')
     return df
+
+
+# ─── NORMALIZED HISTORY FUNCTIONS ──────────────────────────────────────────
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_history_summary(search: str = '', limit: int = 500) -> pd.DataFrame:
+    engine = get_engine()
+    if engine is None: return pd.DataFrame()
+    query = text("""
+        SELECT 
+            hs.ecn,
+            hs.employee_name,
+            hs.record_count,
+            hs.last_updated,
+            GROUP_CONCAT(DISTINCT hf.field_name ORDER BY hf.field_name SEPARATOR ', ') as fields_changed
+        FROM history_summary hs
+        LEFT JOIN history_fields hf ON hs.ecn = hf.ecn
+        WHERE (:search = '' OR hs.ecn LIKE :search OR hs.employee_name LIKE :search)
+        GROUP BY hs.ecn, hs.employee_name, hs.record_count, hs.last_updated
+        ORDER BY hs.last_updated DESC
+        LIMIT :limit
+    """)
+    with engine.connect() as conn:
+        result = conn.execute(query, {'search': f'%{search}%' if search else '', 'limit': limit}).fetchall()
+    if not result: return pd.DataFrame()
+    return pd.DataFrame(result, columns=['ECN', 'Employee', 'Records', 'Last Updated', 'Fields Changed'])
+
+def get_fields_for_ecn(ecn: str) -> list:
+    engine = get_engine()
+    if engine is None: return []
+    query = text('SELECT field_name FROM history_fields WHERE ecn = :ecn ORDER BY field_name')
+    with engine.connect() as conn:
+        result = conn.execute(query, {'ecn': ecn}).fetchall()
+    return [r[0] for r in result]
+
+def get_ecns_by_field(field_name: str, limit: int = 500) -> pd.DataFrame:
+    engine = get_engine()
+    if engine is None: return pd.DataFrame()
+    query = text("""
+        SELECT hs.ecn, hs.employee_name, hs.record_count, hs.last_updated
+        FROM history_summary hs
+        INNER JOIN history_fields hf ON hs.ecn = hf.ecn
+        WHERE hf.field_name = :field_name
+        ORDER BY hs.last_updated DESC
+        LIMIT :limit
+    """)
+    with engine.connect() as conn:
+        result = conn.execute(query, {'field_name': field_name, 'limit': limit}).fetchall()
+    if not result: return pd.DataFrame()
+    return pd.DataFrame(result, columns=['ECN', 'Employee', 'Records', 'Last Updated'])
+
+def get_field_change_counts() -> pd.DataFrame:
+    engine = get_engine()
+    if engine is None: return pd.DataFrame()
+    query = text("""
+        SELECT 
+            field_name,
+            COUNT(DISTINCT ecn) as employee_count,
+            COUNT(*) as total_changes
+        FROM history_fields
+        GROUP BY field_name
+        ORDER BY total_changes DESC
+    """)
+    with engine.connect() as conn:
+        result = conn.execute(query).fetchall()
+    if not result: return pd.DataFrame()
+    return pd.DataFrame(result, columns=['Field', 'Employees', 'Total Changes'])
+
+def refresh_history_summary():
+    engine = get_engine()
+    if engine is None: return
+    try:
+        with engine.connect() as conn:
+            # Rebuild summary table
+            conn.execute(text("""
+                INSERT INTO history_summary (ecn, employee_name, record_count, last_updated)
+                SELECT 
+                    ecn,
+                    MAX(employee_name) as employee_name,
+                    COUNT(*) as record_count,
+                    MAX(start_date) as last_updated
+                FROM history
+                GROUP BY ecn
+                ON DUPLICATE KEY UPDATE
+                    employee_name = VALUES(employee_name),
+                    record_count = VALUES(record_count),
+                    last_updated = VALUES(last_updated)
+            """))
+            # Rebuild fields table
+            conn.execute(text('DELETE FROM history_fields'))
+            conn.execute(text("""
+                INSERT INTO history_fields (ecn, field_name)
+                SELECT DISTINCT ecn, field
+                FROM history
+            """))
+            conn.commit()
+            st.cache_data.clear()
+    except Exception as e:
+        st.error(f'Error refreshing summary: {e}')
+
+def update_history_summary_on_change(ecn: str, employee_name: str, start_date: str):
+    engine = get_engine()
+    if engine is None: return
+    try:
+        with engine.connect() as conn:
+            # Upsert summary
+            conn.execute(text("""
+                INSERT INTO history_summary (ecn, employee_name, record_count, last_updated)
+                VALUES (:ecn, :emp, 1, :date)
+                ON DUPLICATE KEY UPDATE
+                    employee_name = VALUES(employee_name),
+                    record_count = record_count + 1,
+                    last_updated = GREATEST(last_updated, VALUES(last_updated))
+            """), {'ecn': ecn, 'emp': employee_name, 'date': start_date})
+            conn.commit()
+    except Exception:
+        pass
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_all_employees_df() -> pd.DataFrame:
@@ -443,21 +562,34 @@ def get_db_stats():
 with st.sidebar:
     st.image('https://kimi-web-img.moonshot.cn/img/knackrcm.com/26ef9a05ac06e2c7d058a5cafefa681569032b17.png', width=80)
     st.title('Knack RCM')
-    st.markdown('''
+    st.markdown("""
     <style>
-    .stApp { background-color: #f8fafc; }
+    .stApp { background-color: #0f172a; color: #e2e8f0; }
     .stSidebar { background-color: #1a3a5c !important; }
     .stSidebar .stMarkdown { color: white !important; }
     .stSidebar [data-testid='stRadio'] label { color: white !important; font-weight: 500; }
     .stSidebar [data-testid='stRadio'] label:hover { color: #5ba8d8 !important; }
     .stButton>button { background-color: #2d6da8; color: white; border-radius: 6px; border: none; }
-    .stButton>button:hover { background-color: #1a3a5c; color: white; }
+    .stButton>button:hover { background-color: #5ba8d8; color: white; }
     .stButton>button[kind='primary'] { background-color: #2d6da8; }
-    h1, h2, h3 { color: #1a3a5c !important; font-family: 'Segoe UI', sans-serif; }
-    .stDataFrame { border: 1px solid #e2e8f0; border-radius: 8px; }
-    .stMetric { background: white; padding: 16px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    h1, h2, h3 { color: #5ba8d8 !important; font-family: 'Segoe UI', sans-serif; }
+    .stDataFrame { border: 1px solid #334155; border-radius: 8px; }
+    .stDataFrame td { color: #e2e8f0 !important; }
+    .stDataFrame th { background-color: #1e293b !important; color: #5ba8d8 !important; }
+    .stMetric { background: #1e293b; padding: 16px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.3); border: 1px solid #334155; }
+    .stMetric label { color: #94a3b8 !important; }
+    .stMetric div { color: #e2e8f0 !important; }
+    .stTextInput>div>div>input { background-color: #1e293b; color: #e2e8f0; border: 1px solid #334155; }
+    .stSelectbox>div>div>div { background-color: #1e293b; color: #e2e8f0; border: 1px solid #334155; }
+    .stDateInput>div>div>input { background-color: #1e293b; color: #e2e8f0; border: 1px solid #334155; }
+    .stExpander { background-color: #1e293b; border: 1px solid #334155; border-radius: 8px; }
+    .stInfo { background-color: #1e293b; border-left-color: #2d6da8; }
+    .stSuccess { background-color: #1e293b; border-left-color: #22c55e; }
+    .stWarning { background-color: #1e293b; border-left-color: #f59e0b; }
+    .stError { background-color: #1e293b; border-left-color: #ef4444; }
+    .stSpinner > div { border-top-color: #5ba8d8 !important; }
     </style>
-    ''', unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
     st.divider()
     if db_connected():
         st.success('✅ TiDB Connected')
@@ -849,11 +981,10 @@ elif page == '📜 History':
     st.markdown('One row per employee. Click to view, edit, or delete their history records in a modal.')
     if not db_connected(): st.error('Connect TiDB first.'); st.stop()
     engine = get_engine()
-    search = st.text_input('🔍 Search by ECN or Employee name', placeholder='e.g. EMP001 or John Doe')
-    query = text("SELECT ecn, MAX(employee_name) as employee_name, COUNT(*) as record_count, MAX(start_date) as last_updated, GROUP_CONCAT(DISTINCT field ORDER BY field SEPARATOR ', ') as fields_changed FROM history WHERE (:search = '' OR ecn LIKE :search OR employee_name LIKE :search) GROUP BY ecn ORDER BY last_updated DESC LIMIT 500")
-    with engine.connect() as conn: agg_results = conn.execute(query, {'search': f'%{search}%' if search else ''}).fetchall()
-    if not agg_results: st.info('No history records found.'); st.stop()
-    agg_df = pd.DataFrame(agg_results, columns=['ECN', 'Employee', 'Records', 'Last Updated', 'Fields Changed'])
+    if field_filter != 'All Fields':
+        agg_df = get_ecns_by_field(field_filter)
+    else:
+        agg_df = get_history_summary(search)
     st.markdown(f'**{len(agg_df)} employees with history**')
     selected = st.dataframe(agg_df, use_container_width=True, hide_index=True, on_select='rerun', selection_mode='single-row')
     if selected and selected.selection.rows:
@@ -905,6 +1036,18 @@ elif page == '📜 History':
                                     pass
         history_modal()
     st.divider()
+    st.divider()
+    st.subheader('📊 Field Change Analytics')
+    field_stats = get_field_change_counts()
+    if not field_stats.empty:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.bar_chart(field_stats.set_index('Field')['Total Changes'], use_container_width=True)
+        with c2:
+            st.dataframe(field_stats, use_container_width=True, hide_index=True)
+    else:
+        st.info('No field change data available.')
+
     if st.button('🧹 Remove Redundant Records (value == prev_value)'):
         with st.spinner('Cleaning...'): deleted = compact_history()
         st.success(f'Removed **{deleted}** redundant records')
@@ -917,6 +1060,8 @@ elif page == '🛠️ DB Tools':
         try:
             emp_count, active_count, hist_count = get_db_stats()
             st.metric('Total Employees', f'{emp_count:,}'); st.metric('Active', f'{active_count:,}'); st.metric('History Records', f'{hist_count:,}')
+            st.metric('History Summary', f'{conn.execute(text("SELECT COUNT(*) FROM history_summary")).scalar():,}')
+            st.metric('Field Records', f'{conn.execute(text("SELECT COUNT(*) FROM history_fields")).scalar():,}')
         except Exception as e: st.error(f'Could not fetch stats: {e}')
     with c2:
         st.subheader('Cleanup'); st.markdown('Remove history entries where `value == prev_value` (no actual change).')
