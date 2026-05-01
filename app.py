@@ -1296,25 +1296,13 @@ def get_db_stats():
     if engine is None:
         return None, None, None
     try:
-        today_str = date.today().isoformat()
         with engine.connect() as conn:
-            # Total employees valid today (hired on/before today, not separated before today)
-            emp = conn.execute(text("""
-                SELECT COUNT(*) FROM employees
-                WHERE LEFT(ecn,1)!='_'
-                  AND (COALESCE(data->>'$."DOJ Knack"', '') = '' OR data->>'$."DOJ Knack"' <= :today)
-                  AND (COALESCE(data->>'$."Date of Separation"', '') = '' OR data->>'$."Date of Separation"' >= :today)
-            """), {'today': today_str}).scalar()
-
-            # Active among those valid today
-            active = conn.execute(text("""
-                SELECT COUNT(*) FROM employees
-                WHERE LEFT(ecn,1)!='_'
-                  AND (COALESCE(data->>'$."DOJ Knack"', '') = '' OR data->>'$."DOJ Knack"' <= :today)
-                  AND (COALESCE(data->>'$."Date of Separation"', '') = '' OR data->>'$."Date of Separation"' >= :today)
-                  AND data->>'$."Active/Inactive"' = 'Active'
-            """), {'today': today_str}).scalar()
-
+            # Total employees (ecn not starting with _ — excludes custom columns)
+            emp = conn.execute(text("SELECT COUNT(*) FROM employees WHERE LEFT(ecn,1)!='_'")).scalar()
+            # Active employees (raw JSON field, no date filter — fast and accurate)
+            active = conn.execute(text(
+                "SELECT COUNT(*) FROM employees WHERE LEFT(ecn,1)!='_' AND data->>'$.\"Active/Inactive\"'='Active'"
+            )).scalar()
             hist = conn.execute(text('SELECT COUNT(*) FROM history')).scalar()
         return emp, active, hist
     except Exception:
