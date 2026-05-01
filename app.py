@@ -64,7 +64,6 @@ def get_db():
             pool_size=5,
             max_overflow=10,
         )
-        # Test
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
 
@@ -235,7 +234,6 @@ def get_all_employees_df(engine) -> pd.DataFrame:
     df = pd.read_sql(query, engine)
     if df.empty:
         return df
-    # Expand JSON data column
     records = []
     for _, row in df.iterrows():
         data = row["data"]
@@ -263,13 +261,12 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
         return 0, 0, "Database not connected"
 
     total_rows = len(df)
-    # Preload everything into memory ONCE
     existing_df = get_all_employees_df(engine)
     existing_map = {}
     if not existing_df.empty and "ECN" in existing_df.columns:
         existing_map = {row["ECN"]: row.to_dict() for _, row in existing_df.iterrows()}
 
-    # Preload manual edits: latest manual edit date per (ecn, field)
+    # Preload manual edits
     manual_edits = {}
     with engine.connect() as conn:
         result = conn.execute(text("""
@@ -284,7 +281,7 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
     new_employees = []
     history_records = []
     updated_employees = []
-    changed_ecns = set()
+    unchanged_ecns = []
 
     for idx, (_, row) in enumerate(df.iterrows()):
         ecn = str(row.get("ECN", "")).strip()
@@ -297,7 +294,6 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
         eff_from, eff_to = get_effective_dates(row.to_dict(), upload_date)
 
         if existing is None:
-            # New employee
             doc["_created_at"] = upload_date
             doc["_updated_at"] = upload_date
             doc["_last_upload"] = upload_date
@@ -310,7 +306,6 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
             })
             inserted += 1
 
-            # Seed history for non-empty fields
             emp_name = doc.get("Employee", "")
             for field, val in doc.items():
                 if field.startswith("_") or field in ("Effective From", "Effective To") or val == "":
@@ -321,7 +316,6 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
                     "end_date": eff_to, "source": "excel_upload"
                 })
         else:
-            # Existing — check changes
             changed = False
             last_upload = existing.get("_last_upload", "2000-01-01")
             emp_name = doc.get("Employee", existing.get("Employee", ""))
@@ -336,9 +330,6 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
                         skipped_manual += 1
                         continue
 
-                    # Close previous history in bulk later? For now, collect IDs to close
-                    # Actually we need to update end_date for the open record
-                    # We'll do this in a separate batch step for speed
                     history_records.append({
                         "ecn": ecn, "employee_name": emp_name, "field": field,
                         "value": new_val, "prev_value": old_val, "start_date": eff_from,
@@ -357,14 +348,9 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
                     "updated_at": upload_date,
                     "last_upload": upload_date
                 })
-                changed_ecns.add(ecn)
                 updated += 1
             else:
-                # Just update last_upload
-                with engine.connect() as conn:
-                    conn.execute(text("UPDATE employees SET last_upload = :upload WHERE ecn = :ecn"),
-                                 {"ecn": ecn, "upload": upload_date})
-                    conn.commit()
+                unchanged_ecns.append(ecn)
 
         if progress_bar is not None and idx % 50 == 0:
             progress_bar.progress(min(0.95, (idx + 1) / total_rows),
@@ -375,7 +361,7 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
         progress_bar.progress(0.96, text="Writing to TiDB in batches...")
 
     with engine.connect() as conn:
-        # 1. Insert new employees in batches
+        # 1. Insert new employees
         for i in range(0, len(new_employees), BATCH_SIZE):
             batch = new_employees[i:i + BATCH_SIZE]
             conn.execute(text("""
@@ -385,8 +371,7 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
                 data = VALUES(data), updated_at = VALUES(updated_at), last_upload = VALUES(last_upload)
             """), batch)
 
-        # 2. Close previous history records for changed fields
-        # Group by ecn+field to minimize updates
+        # 2. Close previous history records
         close_map = defaultdict(list)
         for h in history_records:
             if h.get("_close_prev"):
@@ -399,7 +384,7 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
                 WHERE ecn = :ecn AND field = :field AND end_date = '9999-12-31' AND start_date < :min_start
             """), {"upload": upload_date, "ecn": ecn, "field": field, "min_start": min_start})
 
-        # 3. Insert history records in batches
+        # 3. Insert history records
         hist_to_insert = [{k: v for k, v in h.items() if not k.startswith("_")} for h in history_records]
         for i in range(0, len(hist_to_insert), BATCH_SIZE):
             batch = hist_to_insert[i:i + BATCH_SIZE]
@@ -410,7 +395,7 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
                 value = VALUES(value), prev_value = VALUES(prev_value), end_date = VALUES(end_date)
             """), batch)
 
-        # 4. Update changed employees in batches
+        # 4. Update changed employees
         for i in range(0, len(updated_employees), BATCH_SIZE):
             batch = updated_employees[i:i + BATCH_SIZE]
             conn.execute(text("""
@@ -418,7 +403,18 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
                 WHERE ecn = :ecn
             """), batch)
 
-        # 5. Log upload
+        # 5. Bulk update last_upload for unchanged employees
+        if unchanged_ecns:
+            for i in range(0, len(unchanged_ecns), BATCH_SIZE):
+                batch = unchanged_ecns[i:i + BATCH_SIZE]
+                placeholders = ",".join([f":ecn_{j}" for j in range(len(batch))])
+                params = {f"ecn_{j}": ecn for j, ecn in enumerate(batch)}
+                conn.execute(text(f"""
+                    UPDATE employees SET last_upload = :upload 
+                    WHERE ecn IN ({placeholders})
+                """), {"upload": upload_date, **params})
+
+        # 6. Log upload
         conn.execute(text("""
             INSERT INTO upload_log (upload_date, rows_processed, inserted, updated, skipped_manual)
             VALUES (:date, :rows, :ins, :upd, :skip)
@@ -440,12 +436,10 @@ def get_employees_at_date(query_date: str) -> pd.DataFrame:
     if engine is None:
         return pd.DataFrame()
 
-    # Fast bulk load
     df = get_all_employees_df(engine)
     if df.empty:
         return df
 
-    # Filter by DOJ and separation in pandas (faster than JSON_EXTRACT per row in SQL for full table)
     if "DOJ Knack" in df.columns:
         df["__doj"] = df["DOJ Knack"].apply(parse_date)
         df = df[df["__doj"].isna() | (df["__doj"] <= query_date)]
@@ -456,7 +450,6 @@ def get_employees_at_date(query_date: str) -> pd.DataFrame:
         df = df[df["__sep"].isna() | (df["__sep"] >= query_date)]
         df = df.drop(columns=["__sep"])
 
-    # Bulk load history overrides for this date
     with engine.connect() as conn:
         result = conn.execute(text("""
             SELECT ecn, field, value FROM history 
@@ -467,10 +460,9 @@ def get_employees_at_date(query_date: str) -> pd.DataFrame:
         overrides = {}
         for ecn, field, value in result:
             key = (ecn, field)
-            if key not in overrides:  # First wins if duplicates
+            if key not in overrides:
                 overrides[key] = value
 
-        # Vectorized update using map instead of row-wise loop
         for (ecn, field), val in overrides.items():
             if field in df.columns:
                 df.loc[df["ECN"] == ecn, field] = val
@@ -492,7 +484,6 @@ def record_manual_edit(ecn: str, field: str, new_value: str, start_date: str, en
         old_value = existing.get(field, "")
 
         with engine.connect() as conn:
-            # Close overlapping
             conn.execute(text("""
                 UPDATE history SET end_date = :start 
                 WHERE ecn = :ecn AND field = :field AND end_date = '9999-12-31' AND start_date <= :start
@@ -503,7 +494,6 @@ def record_manual_edit(ecn: str, field: str, new_value: str, start_date: str, en
                 WHERE ecn = :ecn AND field = :field AND start_date > :start AND start_date < :end
             """), {"start": start_date, "end": end_date, "ecn": ecn, "field": field})
 
-            # Insert new
             conn.execute(text("""
                 INSERT INTO history (ecn, employee_name, field, value, prev_value, start_date, end_date, source)
                 VALUES (:ecn, :emp, :field, :val, :prev, :start, :end, 'manual_edit')
@@ -515,7 +505,6 @@ def record_manual_edit(ecn: str, field: str, new_value: str, start_date: str, en
                 "start": start_date, "end": end_date
             })
 
-            # Update current employee if ongoing
             if end_date == "9999-12-31":
                 existing[field] = new_value
                 existing["_updated_at"] = start_date
@@ -548,14 +537,12 @@ def get_employee_history(ecn: str) -> pd.DataFrame:
 
 
 def delete_history_record(record_id: int):
-    """Delete a history record by ID and restore previous value if applicable."""
     engine = get_engine()
     if engine is None:
         return False, "Database not connected"
 
     try:
         with engine.connect() as conn:
-            # Get record details
             record = conn.execute(
                 text("SELECT * FROM history WHERE id = :id"), {"id": record_id}
             ).mappings().fetchone()
@@ -567,10 +554,8 @@ def delete_history_record(record_id: int):
             field = record["field"]
             start_date = record["start_date"]
 
-            # Delete the record
             conn.execute(text("DELETE FROM history WHERE id = :id"), {"id": record_id})
 
-            # Find previous record to restore
             prev = conn.execute(text("""
                 SELECT * FROM history 
                 WHERE ecn = :ecn AND field = :field AND end_date = :start 
@@ -622,7 +607,6 @@ def update_history_record(record_id: int, new_value: str, new_start: str, new_en
                 WHERE id = :id
             """), {"val": new_value, "start": new_start, "end": new_end, "id": record_id})
 
-            # Update current employee if this was the active ongoing record
             if record["end_date"] == "9999-12-31" or new_end == "9999-12-31":
                 emp = get_employee(engine, record["ecn"])
                 if emp:
@@ -659,7 +643,7 @@ def get_db_stats():
     with engine.connect() as conn:
         emp_count = conn.execute(text("SELECT COUNT(*) FROM employees")).scalar()
         active_count = conn.execute(text("""
-            SELECT COUNT(*) FROM employees WHERE JSON_EXTRACT(data, '$.Active/Inactive') = 'Active'
+            SELECT COUNT(*) FROM employees WHERE JSON_UNQUOTE(JSON_EXTRACT(data, '$."Active/Inactive"')) = 'Active'
         """)).scalar()
         hist_count = conn.execute(text("SELECT COUNT(*) FROM history")).scalar()
     return emp_count, active_count, hist_count
@@ -779,13 +763,11 @@ elif page == "👤 Employee Editor":
     search = st.text_input("🔍 Search by name, ECN, or email", placeholder="e.g. Santos, 12345")
     filter_status = st.selectbox("Filter by Status", ["All", "Active", "Inactive", "LOA", "Maternity", "Suspended"])
 
-    # Load all employees once
     employees_df = get_all_employees_df(engine)
     if employees_df.empty:
         st.warning("No employees found.")
         st.stop()
 
-    # Apply filters
     if "Active/Inactive" in employees_df.columns and filter_status != "All":
         employees_df = employees_df[employees_df["Active/Inactive"] == filter_status]
 
@@ -972,7 +954,7 @@ elif page == "📅 Date Snapshot":
 # ─── PAGE: EXPORT ─────────────────────────────────────────────────────────────
 elif page == "📊 Export Data":
     st.title("📊 Export Data")
-    st.markdown("Export staffing data for any time range.")
+    st.markdown("Export staffing data for any time range. Lightning fast — loads DB once.")
 
     if not db_connected():
         st.error("Connect TiDB first.")
@@ -983,14 +965,13 @@ elif page == "📊 Export Data":
 
     if exp_type == "Daily":
         exp_date = st.date_input("Select date", value=today)
-        start_date = end_date = exp_date.isoformat()
+        dates = [exp_date.isoformat()]
         label = f"daily_{exp_date}"
     elif exp_type == "Weekly":
         week_start = today - timedelta(days=today.weekday())
         exp_week = st.date_input("Week starting (Monday)", value=week_start)
-        start_date = exp_week.isoformat()
-        end_date = (exp_week + timedelta(days=6)).isoformat()
-        label = f"weekly_{start_date}_to_{end_date}"
+        dates = [(exp_week + timedelta(days=i)).isoformat() for i in range(7)]
+        label = f"weekly_{dates[0]}_to_{dates[-1]}"
     elif exp_type == "Monthly":
         c1, c2 = st.columns(2)
         with c1:
@@ -999,13 +980,11 @@ elif page == "📊 Export Data":
         with c2:
             year = st.number_input("Year", min_value=2020, max_value=2035, value=today.year)
         last_day = calendar.monthrange(year, month)[1]
-        start_date = date(year, month, 1).isoformat()
-        end_date = date(year, month, last_day).isoformat()
+        dates = [date(year, month, d).isoformat() for d in range(1, last_day + 1)]
         label = f"monthly_{year}_{month:02d}"
     elif exp_type == "Yearly":
         year = st.number_input("Year", min_value=2020, max_value=2035, value=today.year)
-        start_date = date(year, 1, 1).isoformat()
-        end_date = date(year, 12, 31).isoformat()
+        dates = [date(year, m, d).isoformat() for m in range(1, 13) for d in range(1, calendar.monthrange(year, m)[1] + 1)]
         label = f"yearly_{year}"
     else:
         c1, c2 = st.columns(2)
@@ -1013,10 +992,15 @@ elif page == "📊 Export Data":
             start = st.date_input("Start date", value=today - timedelta(days=7))
         with c2:
             end = st.date_input("End date", value=today)
-        start_date, end_date = start.isoformat(), end.isoformat()
-        label = f"custom_{start_date}_to_{end_date}"
+        start_dt, end_dt = start, end
+        dates = [(start_dt + timedelta(days=i)).isoformat() for i in range((end_dt - start_dt).days + 1)]
+        label = f"custom_{dates[0]}_to_{dates[-1]}"
 
-    st.markdown(f"**Range:** `{start_date}` → `{end_date}`")
+    if len(dates) > 366:
+        st.warning("⚠️ Export limited to 366 days. Please narrow your range.")
+        st.stop()
+
+    st.markdown(f"**Range:** `{dates[0]}` → `{dates[-1]}`  (**{len(dates)} days**)")
 
     export_mode = st.radio("Export Mode", [
         "Single sheet (all dates appended with Date Exported column)",
@@ -1026,41 +1010,93 @@ elif page == "📊 Export Data":
     filter_client2 = st.text_input("Filter by Client (optional)", key="exp_client")
 
     if st.button("📥 Generate Export", type="primary"):
-        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-        days = (end_dt - start_dt).days + 1
+        status = st.empty()
+        status.info("⏳ Loading base data from TiDB (one time)...")
 
-        if days > 366:
-            st.warning("Export limited to 366 days.")
+        # ─── LOAD EVERYTHING ONCE ─────────────────────────────────────────
+        engine = get_engine()
+        base_df = get_all_employees_df(engine)
+        if base_df.empty:
+            st.warning("No employee data found.")
+            st.stop()
+
+        # Pre-compute DOJ/Sep dates for filtering
+        if "DOJ Knack" in base_df.columns:
+            base_df["__doj_dt"] = pd.to_datetime(base_df["DOJ Knack"].apply(parse_date), errors="coerce")
+        else:
+            base_df["__doj_dt"] = pd.NaT
+
+        if "Date of Separation" in base_df.columns:
+            base_df["__sep_dt"] = pd.to_datetime(base_df["Date of Separation"].apply(parse_date), errors="coerce")
+        else:
+            base_df["__sep_dt"] = pd.NaT
+
+        # Load ALL history into memory once
+        with engine.connect() as conn:
+            hist_all = pd.read_sql(text("""
+                SELECT ecn, field, value, start_date, end_date 
+                FROM history
+            """), conn)
+
+        if not hist_all.empty:
+            hist_all["start_dt"] = pd.to_datetime(hist_all["start_date"], errors="coerce")
+            hist_all["end_dt"] = pd.to_datetime(hist_all["end_date"], errors="coerce")
+
+        status.info(f"⏳ Processing {len(dates)} days in-memory...")
+
+        all_dfs = []
+        date_objs = [datetime.strptime(d, "%Y-%m-%d").date() for d in dates]
+
+        for i, d_str in enumerate(dates):
+            d = date_objs[i]
+            d_ts = pd.Timestamp(d)
+
+            # Vectorized filter: keep if DOJ <= date AND (Sep is null OR Sep >= date)
+            mask = pd.Series(True, index=base_df.index)
+            if "__doj_dt" in base_df.columns:
+                mask &= base_df["__doj_dt"].isna() | (base_df["__doj_dt"] <= d_ts)
+            if "__sep_dt" in base_df.columns:
+                mask &= base_df["__sep_dt"].isna() | (base_df["__sep_dt"] >= d_ts)
+
+            df_day = base_df[mask].copy()
+
+            # Apply history overrides for this date (vectorized)
+            if not hist_all.empty:
+                day_hist = hist_all[(hist_all["start_dt"] <= d_ts) & (hist_all["end_dt"] > d_ts)]
+                if not day_hist.empty:
+                    # Keep latest start date per ecn+field
+                    day_hist = day_hist.sort_values("start_dt", ascending=False).drop_duplicates(subset=["ecn", "field"])
+                    for _, hrow in day_hist.iterrows():
+                        if hrow["field"] in df_day.columns:
+                            df_day.loc[df_day["ECN"] == hrow["ecn"], hrow["field"]] = hrow["value"]
+
+            # Drop internal cols
+            df_day = df_day.drop(columns=[c for c in df_day.columns if c.startswith("__")], errors="ignore")
+            df_day = df_day.drop(columns=[c for c in df_day.columns if c.startswith("_")], errors="ignore")
+
+            # Apply filters
+            if filter_active and "Active/Inactive" in df_day.columns:
+                df_day = df_day[df_day["Active/Inactive"] == "Active"]
+            if filter_client2 and "Client" in df_day.columns:
+                df_day = df_day[df_day["Client"].str.contains(filter_client2, case=False, na=False)]
+
+            if not df_day.empty:
+                df_day["Date Exported"] = d_str
+                all_dfs.append(df_day)
+
+            if i % 30 == 0 or i == len(dates) - 1:
+                status.info(f"⏳ Processed {i + 1}/{len(dates)} days...")
+
+        if not all_dfs:
+            st.warning("No data found for the selected range.")
             st.stop()
 
         if export_mode.startswith("Single"):
-            all_dfs = []
-            status = st.empty()
-            for i in range(days):
-                d = (start_dt + timedelta(days=i)).date().isoformat()
-                df_day = get_employees_at_date(d)
-                if df_day.empty:
-                    continue
-                if filter_active and "Active/Inactive" in df_day.columns:
-                    df_day = df_day[df_day["Active/Inactive"] == "Active"]
-                if filter_client2 and "Client" in df_day.columns:
-                    df_day = df_day[df_day["Client"].str.contains(filter_client2, case=False, na=False)]
-                if not df_day.empty:
-                    df_day["Date Exported"] = d
-                    all_dfs.append(df_day)
-                if i % 10 == 0 or i == days - 1:
-                    status.text(f"Processing... {i + 1}/{days} days")
-
-            if not all_dfs:
-                st.warning("No data found.")
-                st.stop()
-
             combined = pd.concat(all_dfs, ignore_index=True)
             cols = ["Date Exported"] + [c for c in combined.columns if c != "Date Exported"]
             combined = combined[cols]
 
-            st.success(f"✅ {len(combined):,} rows across {len(all_dfs)} days")
+            status.success(f"✅ {len(combined):,} rows across {len(all_dfs)} days")
             st.dataframe(combined.head(20), use_container_width=True)
 
             st.download_button(
@@ -1070,34 +1106,24 @@ elif page == "📊 Export Data":
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
         else:
-            if days > 31:
-                st.warning("One sheet per day limited to 31 days.")
+            if len(dates) > 31:
+                st.warning("One sheet per day mode is limited to 31 days.")
                 st.stop()
 
             buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
                 wb = writer.book
                 header_fmt = wb.add_format({"bold": True, "bg_color": "#1f4e79", "font_color": "white"})
-                status = st.empty()
 
-                for i in range(days):
-                    d = (start_dt + timedelta(days=i)).date().isoformat()
-                    df_day = get_employees_at_date(d)
-                    if filter_active and "Active/Inactive" in df_day.columns:
-                        df_day = df_day[df_day["Active/Inactive"] == "Active"]
-                    if filter_client2 and "Client" in df_day.columns:
-                        df_day = df_day[df_day["Client"].str.contains(filter_client2, case=False, na=False)]
-
-                    sheet = d.replace("-", "")[-6:]
+                for i, df_day in enumerate(all_dfs):
+                    d_str = dates[i]
+                    sheet = d_str.replace("-", "")[-6:]
                     df_day.to_excel(writer, index=False, sheet_name=sheet)
                     ws = writer.sheets[sheet]
                     for col_num, col_name in enumerate(df_day.columns):
                         ws.write(0, col_num, col_name, header_fmt)
 
-                    if i % 5 == 0 or i == days - 1:
-                        status.text(f"Building sheets... {i + 1}/{days}")
-
-            st.success(f"✅ {days} daily sheets generated!")
+            status.success(f"✅ {len(all_dfs)} daily sheets generated!")
             st.download_button(
                 "⬇️ Download Daily Export",
                 data=buf.getvalue(),
@@ -1118,7 +1144,6 @@ elif page == "📜 History Manager":
     engine = get_engine()
     search = st.text_input("🔍 Search by ECN or Employee name", placeholder="e.g. EMP001 or John Doe")
 
-    # Get aggregated employee view from history
     query = text("""
         SELECT 
             ecn,
@@ -1159,13 +1184,11 @@ elif page == "📜 History Manager":
         st.divider()
         st.subheader(f"📋 History for {emp_name or ecn} ({ecn})")
 
-        # Fetch full history for this employee
         hist_df = get_employee_history(ecn)
         if hist_df.empty:
             st.info("No detailed history found.")
             st.stop()
 
-        # Show as editable cards
         for _, row in hist_df.iterrows():
             with st.container(border=True):
                 c1, c2, c3 = st.columns([3, 1, 1])
@@ -1181,7 +1204,6 @@ elif page == "📜 History Manager":
                         st.session_state[f"del_mode_{row['ECN']}_{row['Field']}_{row['Start']}"] = True
                         st.rerun()
 
-                # Inline edit form
                 edit_key = f"edit_mode_{row['ECN']}_{row['Field']}_{row['Start']}"
                 if st.session_state.get(edit_key):
                     with st.form(key=f"form_{edit_key}"):
@@ -1194,7 +1216,6 @@ elif page == "📜 History Manager":
                         with nc3:
                             new_end = st.text_input("End Date", value=row["End"], key=f"e_{edit_key}")
 
-                        # We need the record ID for updates. Fetch it.
                         with engine.connect() as conn:
                             rec = conn.execute(text("""
                                 SELECT id FROM history 
@@ -1217,7 +1238,6 @@ elif page == "📜 History Manager":
                                 del st.session_state[edit_key]
                                 st.rerun()
 
-                # Inline delete confirmation
                 del_key = f"del_mode_{row['ECN']}_{row['Field']}_{row['Start']}"
                 if st.session_state.get(del_key):
                     st.warning("Are you sure you want to delete this record?")
