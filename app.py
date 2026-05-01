@@ -804,12 +804,26 @@ def load_excel(uploaded_file) -> pd.DataFrame:
         df = pd.read_excel(uploaded_file, sheet_name=sheet, dtype=str)
         df.columns = [str(c).strip() for c in df.columns]
         df = df.fillna('')
+
+        # Date Exported is auto-generated — exclude from upload
+        if 'Date Exported' in df.columns:
+            df = df.drop(columns=['Date Exported'])
+            st.toast('Date Exported is auto-generated and was excluded from upload', icon='ℹ️')
+
         accepted = set(get_all_accepted_columns())
         keep = [c for c in df.columns if c in accepted]
         ignored = [c for c in df.columns if c not in accepted]
         if ignored:
             st.toast(f'Skipped {len(ignored)} unrecognised column(s)', icon='⚠️')
         df = df[keep]
+
+        # Ensure Active/Inactive exists and default blanks to Inactive
+        if 'Active/Inactive' not in df.columns:
+            df['Active/Inactive'] = 'Inactive'
+            st.toast('Active/Inactive column was missing — defaulted to Inactive', icon='⚠️')
+        else:
+            df.loc[df['Active/Inactive'].astype(str).str.strip() == '', 'Active/Inactive'] = 'Inactive'
+
         if 'ECN' in df.columns:
             before = len(df)
             df = df.drop_duplicates(subset=['ECN'], keep='last')
@@ -1109,7 +1123,9 @@ def get_employees_at_date(query_date: str) -> pd.DataFrame:
                     df.loc[df['ECN'] == ecn, field] = val
         ref = datetime.strptime(query_date, '%Y-%m-%d').date()
         df = filter_accepted_columns(df)
-        df = apply_aging_bucket(df, ref_date=ref)
+        # Auto-generate Date Exported based on the snapshot date
+        df['Date Exported'] = query_date
+        df = apply_aging_bucket(df, ref_date=ref, use_date_exported=True)
         df = apply_active_nulls(df)
         df = reorder_columns(df)
         internal = [c for c in df.columns if c.startswith('_')]
@@ -1160,13 +1176,13 @@ def get_employee_history(ecn: str) -> pd.DataFrame:
         return pd.DataFrame()
     try:
         df = pd.read_sql(
-            text('SELECT ecn, employee_name, field, value, prev_value, start_date, end_date, source '
+            text('SELECT id, ecn, employee_name, field, value, prev_value, start_date, end_date, source '
                  'FROM history WHERE ecn=:ecn ORDER BY field, start_date DESC'),
             engine, params={'ecn': ecn}
         )
         if df.empty:
             return df
-        df.columns = ['ECN', 'Employee', 'Field', 'Value', 'Previous', 'Start', 'End', 'Source']
+        df.columns = ['ID', 'ECN', 'Employee', 'Field', 'Value', 'Previous', 'Start', 'End', 'Source']
         return df
     except Exception:
         return pd.DataFrame()
@@ -1886,53 +1902,69 @@ elif page == 'history':
             hist_df = get_employee_history(ecn)
             if hist_df.empty:
                 st.info('No detailed records.'); return
-            for _, row in hist_df.iterrows():
-                with st.container(border=True):
-                    ca, cb, cc = st.columns([3, 1, 1])
-                    with ca:
-                        st.markdown(
-                            f"**{row['Field']}**  \n"
-                            f"`{row['Previous'] or '(blank)'}` → `{row['Value']}`"
-                        )
-                        st.caption(f"📅 {row['Start']} → {row['End']}  ·  🏷️ {row['Source']}")
-                    with cb:
-                        with st.popover('✏️ Edit', use_container_width=True):
-                            with st.form(key=f"ef_{row['ECN']}_{row['Field']}_{row['Start']}"):
-                                nv = st.text_input('Value', value=row['Value'])
-                                ns = st.text_input('Start', value=row['Start'])
-                                ne = st.text_input('End',   value=row['End'])
-                                try:
-                                    with engine.connect() as conn:
-                                        rec = conn.execute(text(
-                                            'SELECT id FROM history WHERE ecn=:ecn AND field=:f AND start_date=:s'
-                                        ), {'ecn': row['ECN'], 'f': row['Field'], 's': row['Start']}).fetchone()
-                                except Exception:
-                                    rec = None
-                                sc1, sc2 = st.columns(2)
-                                if sc1.form_submit_button('💾 Save', type='primary'):
-                                    if rec:
-                                        ok, msg = update_history_record(rec[0], nv, ns, ne)
-                                        (st.success if ok else st.error)(msg)
-                                        if ok: st.rerun()
-                                sc2.form_submit_button('Cancel')
-                    with cc:
-                        with st.popover('🗑️ Delete', use_container_width=True):
-                            st.warning('Delete this record?')
-                            try:
-                                with engine.connect() as conn:
-                                    rec = conn.execute(text(
-                                        'SELECT id FROM history WHERE ecn=:ecn AND field=:f AND start_date=:s'
-                                    ), {'ecn': row['ECN'], 'f': row['Field'], 's': row['Start']}).fetchone()
-                            except Exception:
-                                rec = None
-                            dc1, dc2 = st.columns(2)
-                            if dc1.button('✅ Yes', type='primary',
-                                          key=f"dy_{row['ECN']}_{row['Field']}_{row['Start']}"):
-                                if rec:
-                                    ok, msg = delete_history_record(rec[0])
-                                    (st.success if ok else st.error)(msg)
-                                    if ok: st.rerun()
-                            dc2.button('Cancel', key=f"dn_{row['ECN']}_{row['Field']}_{row['Start']}")
+
+            st.caption(f'{len(hist_df)} record(s) — select a row to edit or delete')
+
+            # Fast dataframe display instead of slow per-row containers
+            sel_hist = st.dataframe(
+                hist_df,
+                use_container_width=True,
+                hide_index=True,
+                on_select='rerun',
+                selection_mode='single-row'
+            )
+
+            if sel_hist and sel_hist.selection.rows:
+                h_idx = sel_hist.selection.rows[0]
+                row = hist_df.iloc[h_idx]
+                rec_id = int(row['ID'])
+
+                st.divider()
+                st.markdown(
+                    f"**Editing:** `{row['Field']}` &nbsp;|&nbsp; "
+                    f"`{row['Start']}` → `{row['End']}`"
+                )
+
+                with st.form(key=f'hist_edit_form_{rec_id}'):
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        nv = st.text_input('Value', value=row['Value'])
+                    with c2:
+                        ns = st.text_input('Start Date', value=row['Start'])
+                    with c3:
+                        ne = st.text_input('End Date', value=row['End'])
+
+                    st.markdown(f"Previous value: `{row['Previous'] or '(blank)'}`")
+
+                    confirm_del = st.checkbox('Confirm deletion', key=f'confirm_del_{rec_id}')
+
+                    c_save, c_del, c_spacer = st.columns([1, 1, 3])
+                    with c_save:
+                        save_btn = st.form_submit_button('💾 Save', type='primary')
+                    with c_del:
+                        del_btn = st.form_submit_button('🗑️ Delete')
+
+                # Handle actions outside the form for clean rerun behaviour
+                if save_btn:
+                    ok, msg = update_history_record(rec_id, nv, ns, ne)
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+                if del_btn:
+                    if confirm_del:
+                        ok, msg = delete_history_record(rec_id)
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                    else:
+                        st.warning('Check the confirmation box to delete')
+            else:
+                st.info('Select a record from the table above to edit or delete.')
 
         _history_modal()
 
