@@ -351,7 +351,7 @@ def get_db_stats():
     if engine is None: return None, None, None
     with engine.connect() as conn:
         emp_count = conn.execute(text('SELECT COUNT(*) FROM employees')).scalar()
-        active_count = conn.execute(text("SELECT COUNT(*) FROM employees WHERE JSON_UNQUOTE(JSON_EXTRACT(data, '$.'Active/Inactive'')) = 'Active'")).scalar()
+        active_count = conn.execute(text("SELECT COUNT(*) FROM employees WHERE data->>'$.\"Active/Inactive\"' = 'Active'")).scalar()
         hist_count = conn.execute(text('SELECT COUNT(*) FROM history')).scalar()
     return emp_count, active_count, hist_count
 
@@ -406,20 +406,83 @@ elif page == '👤 Employee Editor':
     engine = get_engine()
     if engine is None: st.error('Connect TiDB first.'); st.stop()
     st.info('**How it works:** Select multiple employees with checkboxes, then click **Bulk Edit** to edit them all at once. Or click any single row to edit individually. Fields that share the same value across selected employees are pre-filled.')
-    search = st.text_input('🔍 Search by name, ECN, or email', placeholder='e.g. Santos, 12345')
-    filter_status = st.selectbox('Filter by Status', ['All', 'Active', 'Inactive', 'LOA', 'Maternity', 'Suspended'])
+
     employees_df = get_all_employees_df(engine)
     if employees_df.empty: st.warning('No employees found.'); st.stop()
-    if 'Active/Inactive' in employees_df.columns and filter_status != 'All': employees_df = employees_df[employees_df['Active/Inactive'] == filter_status]
+
+    # ─── FILTERS ─────────────────────────────────────────────────────────────
+    st.markdown('**Filters**')
+    filter_cols = st.columns(4)
+    with filter_cols[0]:
+        search = st.text_input('🔍 Search name / ECN / email', placeholder='e.g. Santos, 12345', key='ee_search')
+    with filter_cols[1]:
+        status_opts = ['All'] + sorted(employees_df['Active/Inactive'].dropna().unique().tolist()) if 'Active/Inactive' in employees_df.columns else ['All']
+        filter_status = st.selectbox('Status', status_opts, key='ee_status')
+    with filter_cols[2]:
+        bb_opts = ['All'] + sorted(employees_df['Billable/Buffer'].dropna().unique().tolist()) if 'Billable/Buffer' in employees_df.columns else ['All']
+        filter_bb = st.selectbox('Billable/Buffer', bb_opts, key='ee_bb')
+    with filter_cols[3]:
+        loc_opts = ['All'] + sorted(employees_df['Location'].dropna().unique().tolist()) if 'Location' in employees_df.columns else ['All']
+        filter_loc = st.selectbox('Location', loc_opts, key='ee_loc')
+
+    filter_cols2 = st.columns(4)
+    with filter_cols2[0]:
+        client_opts = ['All'] + sorted(employees_df['Client'].dropna().unique().tolist()) if 'Client' in employees_df.columns else ['All']
+        filter_client = st.selectbox('Client', client_opts, key='ee_client')
+    with filter_cols2[1]:
+        sp_opts = ['All'] + sorted(employees_df['Sub-Process'].dropna().unique().tolist()) if 'Sub-Process' in employees_df.columns else ['All']
+        filter_sp = st.selectbox('Sub-Process', sp_opts, key='ee_sp')
+    with filter_cols2[2]:
+        role_opts = ['All'] + sorted(employees_df['Role'].dropna().unique().tolist()) if 'Role' in employees_df.columns else ['All']
+        filter_role = st.selectbox('Role', role_opts, key='ee_role')
+    with filter_cols2[3]:
+        sup_opts = ['All'] + sorted(employees_df['Supervisor'].dropna().unique().tolist()) if 'Supervisor' in employees_df.columns else ['All']
+        filter_sup = st.selectbox('Supervisor', sup_opts, key='ee_sup')
+
+    # Apply filters
+    if 'Active/Inactive' in employees_df.columns and filter_status != 'All':
+        employees_df = employees_df[employees_df['Active/Inactive'] == filter_status]
+    if 'Billable/Buffer' in employees_df.columns and filter_bb != 'All':
+        employees_df = employees_df[employees_df['Billable/Buffer'] == filter_bb]
+    if 'Location' in employees_df.columns and filter_loc != 'All':
+        employees_df = employees_df[employees_df['Location'] == filter_loc]
+    if 'Client' in employees_df.columns and filter_client != 'All':
+        employees_df = employees_df[employees_df['Client'] == filter_client]
+    if 'Sub-Process' in employees_df.columns and filter_sp != 'All':
+        employees_df = employees_df[employees_df['Sub-Process'] == filter_sp]
+    if 'Role' in employees_df.columns and filter_role != 'All':
+        employees_df = employees_df[employees_df['Role'] == filter_role]
+    if 'Supervisor' in employees_df.columns and filter_sup != 'All':
+        employees_df = employees_df[employees_df['Supervisor'] == filter_sup]
     if search:
         s = search.lower()
         mask = (employees_df.get('Employee', '').str.lower().str.contains(s, na=False) | employees_df.get('ECN', '').str.lower().str.contains(s, na=False) | employees_df.get('Email', '').str.lower().str.contains(s, na=False))
         employees_df = employees_df[mask]
+
     if employees_df.empty: st.warning('No employees match your filters.'); st.stop()
+
     display_cols = ['ECN', 'Employee', 'Client', 'Sub-Process', 'Role', 'Billable/Buffer', 'Active/Inactive', 'Location', 'Overall Location']
     display_cols = [c for c in display_cols if c in employees_df.columns]
     st.markdown(f'**{len(employees_df)} employees found**')
-    edit_df = employees_df[display_cols].copy(); edit_df['Select'] = False; cols_order = ['Select'] + display_cols; edit_df = edit_df[cols_order]
+
+    # Select All / Clear
+    sa_col1, sa_col2, sa_col3 = st.columns([1, 1, 4])
+    with sa_col1:
+        if st.button('☑️ Select All', key='ee_select_all'):
+            st.session_state['select_all_employees'] = True
+            st.rerun()
+    with sa_col2:
+        if st.button('⬜ Clear', key='ee_clear_sel'):
+            st.session_state['select_all_employees'] = False
+            st.rerun()
+    with sa_col3:
+        st.write('')
+
+    select_default = st.session_state.get('select_all_employees', False)
+    edit_df = employees_df[display_cols].copy()
+    edit_df['Select'] = select_default
+    cols_order = ['Select'] + display_cols
+    edit_df = edit_df[cols_order]
     edited = st.data_editor(edit_df, use_container_width=True, hide_index=True, column_config={'Select': st.column_config.CheckboxColumn('Select', default=False)}, disabled=display_cols)
     selected_indices = edited[edited['Select'] == True].index.tolist()
     selected_emps = employees_df.loc[selected_indices] if selected_indices else pd.DataFrame()
@@ -498,7 +561,6 @@ elif page == '👤 Employee Editor':
                 with c2:
                     if st.button('❌ Cancel', key='be_cancel'): st.session_state['show_bulk_edit'] = False; st.rerun()
             bulk_edit_modal()
-
 elif page == '📅 Date Snapshot':
     st.title('📅 Date Snapshot')
     st.markdown('View staffing data **as it was on any specific date**.')
@@ -655,53 +717,44 @@ elif page == '📜 History Manager':
                         st.markdown(f"**{row['Field']}**  \n`{row['Previous'] or '(blank)'}` → `{row['Value']}`")
                         st.caption(f"📅 {row['Start']} → {row['End']}  |  🏷️ {row['Source']}")
                     with c2:
-                        if st.button('✏️ Edit', key=f"edit_{row['ECN']}_{row['Field']}_{row['Start']}"):
-                            st.session_state['hist_edit_id'] = {'ecn': row['ECN'], 'field': row['Field'], 'start': row['Start'], 'value': row['Value'], 'end': row['End']}
-                            st.rerun()
+                        with st.popover('✏️ Edit', use_container_width=True):
+                            with st.form(key=f"edit_form_{row['ECN']}_{row['Field']}_{row['Start']}"):
+                                st.markdown(f"**Edit {row['Field']}**")
+                                nv = st.text_input('Value', value=row['Value'])
+                                ns = st.text_input('Start Date', value=row['Start'])
+                                ne = st.text_input('End Date', value=row['End'])
+                                with engine.connect() as conn:
+                                    rec = conn.execute(text('SELECT id FROM history WHERE ecn = :ecn AND field = :field AND start_date = :start'), {'ecn': row['ECN'], 'field': row['Field'], 'start': row['Start']}).fetchone()
+                                c1, c2 = st.columns(2)
+                                with c1:
+                                    submitted = st.form_submit_button('💾 Save', type='primary')
+                                    if submitted and rec:
+                                        ok, msg = update_history_record(rec[0], nv, ns, ne)
+                                        if ok: st.success(msg); st.rerun()
+                                        else: st.error(msg)
+                                with c2:
+                                    if st.form_submit_button('Cancel'):
+                                        pass
                     with c3:
-                        if st.button('🗑️ Delete', key=f"del_{row['ECN']}_{row['Field']}_{row['Start']}"):
-                            st.session_state['hist_del_id'] = {'ecn': row['ECN'], 'field': row['Field'], 'start': row['Start']}
-                            st.rerun()
-            # Edit form inside modal
-            if st.session_state.get('hist_edit_id'):
-                edit_info = st.session_state['hist_edit_id']; st.divider(); st.subheader('✏️ Edit Record')
-                with st.form(key='hist_edit_form'):
-                    nc1, nc2, nc3 = st.columns(3)
-                    with nc1: new_val = st.text_input('Value', value=edit_info['value'])
-                    with nc2: new_start = st.text_input('Start Date', value=edit_info['start'])
-                    with nc3: new_end = st.text_input('End Date', value=edit_info['end'])
-                    with engine.connect() as conn:
-                        rec = conn.execute(text('SELECT id FROM history WHERE ecn = :ecn AND field = :field AND start_date = :start'), {'ecn': edit_info['ecn'], 'field': edit_info['field'], 'start': edit_info['start']}).fetchone()
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        submitted = st.form_submit_button('💾 Save', type='primary')
-                        if submitted:
-                            if rec:
-                                ok, msg = update_history_record(rec[0], new_val, new_start, new_end)
-                                if ok: st.success(msg); del st.session_state['hist_edit_id']; st.rerun()
-                                else: st.error(msg)
-                    with c2:
-                        if st.form_submit_button('Cancel'): del st.session_state['hist_edit_id']; st.rerun()
-            # Delete confirmation inside modal
-            if st.session_state.get('hist_del_id'):
-                del_info = st.session_state['hist_del_id']; st.divider(); st.warning('Are you sure you want to delete this record?')
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.button('✅ Yes, Delete', type='primary'):
-                        with engine.connect() as conn:
-                            rec = conn.execute(text('SELECT id FROM history WHERE ecn = :ecn AND field = :field AND start_date = :start'), {'ecn': del_info['ecn'], 'field': del_info['field'], 'start': del_info['start']}).fetchone()
-                        if rec:
-                            ok, msg = delete_history_record(rec[0])
-                            if ok: st.success(msg); del st.session_state['hist_del_id']; st.rerun()
-                            else: st.error(msg)
-                with c2:
-                    if st.button('Cancel'): del st.session_state['hist_del_id']; st.rerun()
+                        with st.popover('🗑️ Delete', use_container_width=True):
+                            st.warning('Delete this record?')
+                            with engine.connect() as conn:
+                                rec = conn.execute(text('SELECT id FROM history WHERE ecn = :ecn AND field = :field AND start_date = :start'), {'ecn': row['ECN'], 'field': row['Field'], 'start': row['Start']}).fetchone()
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                if st.button('✅ Yes, Delete', type='primary', key=f"del_y_{row['ECN']}_{row['Field']}_{row['Start']}"):
+                                    if rec:
+                                        ok, msg = delete_history_record(rec[0])
+                                        if ok: st.success(msg); st.rerun()
+                                        else: st.error(msg)
+                            with c2:
+                                if st.button('Cancel', key=f"del_n_{row['ECN']}_{row['Field']}_{row['Start']}"):
+                                    pass
         history_modal()
     st.divider()
     if st.button('🧹 Remove Redundant Records (value == prev_value)'):
         with st.spinner('Cleaning...'): deleted = compact_history()
         st.success(f'Removed **{deleted}** redundant records')
-
 elif page == '🛠️ DB Tools':
     st.title('🛠️ Database Tools')
     if not db_connected(): st.error('Connect TiDB first.'); st.stop()
