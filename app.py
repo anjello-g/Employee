@@ -1459,16 +1459,15 @@ elif page == 'employees':
         st.error('Connect TiDB first.')
         st.stop()
 
-    st.info('Select employees with checkboxes then click **Bulk Edit** · single selection opens individual edit')
-
     employees_df = get_all_employees_df()
     if employees_df.empty:
         st.warning('No employees found. Upload data first.')
         st.stop()
 
-    # Filters — row 1
+    # ── Filters ─────────────────────────────────────────────────────────────
+    section_label('Filters')
     fc = st.columns(4)
-    search      = fc[0].text_input('🔍 Search', placeholder='Name / ECN / Email', label_visibility='collapsed')
+    search      = fc[0].text_input('🔍 Search', placeholder='Name / ECN / Email', label_visibility='collapsed', key='ee_search')
     fs_opts     = ['All'] + sorted(employees_df['Active/Inactive'].dropna().unique().tolist()) if 'Active/Inactive' in employees_df.columns else ['All']
     filter_status = fc[1].selectbox('Status', fs_opts, key='ee_status')
     bb_opts     = ['All'] + sorted(employees_df['Billable/Buffer'].dropna().unique().tolist()) if 'Billable/Buffer' in employees_df.columns else ['All']
@@ -1476,7 +1475,6 @@ elif page == 'employees':
     loc_opts    = ['All'] + sorted(employees_df['Location'].dropna().unique().tolist()) if 'Location' in employees_df.columns else ['All']
     filter_loc  = fc[3].selectbox('Location', loc_opts, key='ee_loc')
 
-    # Filters — row 2
     fc2 = st.columns(4)
     cl_opts  = ['All'] + sorted(employees_df['Client'].dropna().unique().tolist()) if 'Client' in employees_df.columns else ['All']
     filter_cl = fc2[0].selectbox('Client', cl_opts, key='ee_cl')
@@ -1514,27 +1512,53 @@ elif page == 'employees':
     employees_df = reorder_columns(employees_df)
     display_cols = [c for c in DISPLAY_ORDER if c in employees_df.columns][:10]
 
+    # ── Selection mode ──────────────────────────────────────────────────────
+    section_label('Selection')
+    edit_mode = st.radio('Edit mode', ['Single select', 'Bulk edit'], horizontal=True, key='ee_mode')
+
+    # Track selected indices in session_state for persistence across reruns
+    if '_ee_selected' not in st.session_state:
+        st.session_state['_ee_selected'] = []
+    if '_ee_prev_mode' not in st.session_state:
+        st.session_state['_ee_prev_mode'] = edit_mode
+
+    # Clear selection when switching modes
+    if st.session_state['_ee_prev_mode'] != edit_mode:
+        st.session_state['_ee_selected'] = []
+        st.session_state['_ee_prev_mode'] = edit_mode
+        st.rerun()
+
     sa1, sa2, sa3 = st.columns([1, 1, 4])
     with sa1:
         if st.button('☑️  Select All', key='ee_all'):
-            st.session_state['_sel_all'] = True; st.rerun()
+            st.session_state['_ee_selected'] = employees_df.index.tolist()
+            st.rerun()
     with sa2:
         if st.button('⬜  Clear', key='ee_clear'):
-            st.session_state['_sel_all'] = False; st.rerun()
+            st.session_state['_ee_selected'] = []
+            st.session_state['_bulk_edit'] = False
+            st.rerun()
     with sa3:
         st.caption(f'{len(employees_df):,} employees shown')
 
-    sel_default = st.session_state.get('_sel_all', False)
+    # Build dataframe with checkboxes — use session_state for persistence
     edit_df = employees_df[display_cols].copy()
-    edit_df.insert(0, 'Select', sel_default)
+    edit_df.insert(0, 'Select', False)
+    for idx in st.session_state['_ee_selected']:
+        if idx in edit_df.index:
+            edit_df.at[idx, 'Select'] = True
+
     edited = st.data_editor(
         edit_df, use_container_width=True, hide_index=True,
         column_config={'Select': st.column_config.CheckboxColumn('Select', default=False)},
         disabled=display_cols,
     )
-    sel_idx = edited[edited['Select'] == True].index.tolist()
+    # Update session_state with current selections
+    st.session_state['_ee_selected'] = edited[edited['Select'] == True].index.tolist()
+    sel_idx = st.session_state['_ee_selected']
 
-    if len(sel_idx) == 1:
+    # ── Single edit ─────────────────────────────────────────────────────────
+    if edit_mode == 'Single select' and len(sel_idx) >= 1:
         emp = employees_df.loc[sel_idx[0]].to_dict()
         ecn = emp['ECN']
 
@@ -1574,13 +1598,17 @@ elif page == 'employees':
             if st.button('💾  Save Changes', type='primary', key=f'ses_{ecn}'):
                 saved = sum(1 for f, v in changes.items() if record_manual_edit(ecn, f, v, eff_from_s, eff_to_s)[0])
                 if saved:
-                    st.success(f'{saved} field(s) updated!'); st.rerun()
+                    st.success(f'{saved} field(s) updated!')
+                    st.session_state['_ee_selected'] = []
+                    st.rerun()
 
         _single_edit()
 
-    elif len(sel_idx) > 1:
-        if st.button('🔧  Bulk Edit Selected', type='primary'):
-            st.session_state['_bulk_edit'] = True; st.rerun()
+    # ── Bulk edit ────────────────────────────────────────────────────────────
+    elif edit_mode == 'Bulk edit' and len(sel_idx) > 1:
+        if st.button('🔧  Bulk Edit Selected', type='primary', key='be_open'):
+            st.session_state['_bulk_edit'] = True
+            st.rerun()
 
         if st.session_state.get('_bulk_edit'):
             @st.dialog(f'🔧 Bulk Edit — {len(sel_idx)} Employees', width='large')
@@ -1639,10 +1667,13 @@ elif page == 'employees':
                             if record_manual_edit(ecn, f, v, eff_from_s, eff_to_s)[0]
                         )
                         st.success(f'{saved} field updates saved!')
-                        st.session_state['_bulk_edit'] = False; st.rerun()
+                        st.session_state['_ee_selected'] = []
+                        st.session_state['_bulk_edit'] = False
+                        st.rerun()
                 with bc2:
                     if st.button('Cancel', key='be_cancel'):
-                        st.session_state['_bulk_edit'] = False; st.rerun()
+                        st.session_state['_bulk_edit'] = False
+                        st.rerun()
 
             _bulk_edit()
 
@@ -1701,10 +1732,9 @@ elif page == 'export':
     )
     st.markdown('<div style="height:0.5rem;"></div>', unsafe_allow_html=True)
 
-    ec1, ec2, ec3 = st.columns(3)
+    ec1, ec2 = st.columns(2)
     export_mode   = ec1.radio('Sheet mode', ['Single sheet', 'One sheet per day'])
     filter_active = ec2.checkbox('Active employees only', value=False)
-    exclude_sep   = ec3.checkbox('Exclude separated employees', value=False)
     filter_cl3    = st.text_input('Filter by Client (optional)', key='exp_cl')
 
     if st.button('📥  Generate Export', type='primary'):
@@ -1753,11 +1783,6 @@ elif page == 'export':
             doj_mask = base_clean['__doj_dt'].isna() | (base_clean['__doj_dt'] <= d_ts)
             excluded_doj += (~doj_mask).sum()
             mask &= doj_mask
-            # Optionally exclude already-separated employees
-            if exclude_sep:
-                sep_mask = base_clean['__sep_dt'].isna() | (base_clean['__sep_dt'] >= d_ts)
-                excluded_sep += (~sep_mask).sum()
-                mask &= sep_mask
             df_day = base_clean[mask].copy()
             if df_day.empty:
                 continue
@@ -1796,7 +1821,6 @@ elif page == 'export':
             f'border-radius:6px;padding:0.6rem 1rem;font-size:0.85rem;color:var(--text-muted);margin-bottom:0.75rem;">'
             f'Loaded <b>{total_loaded:,}</b> from DB · '
             f'Excluded <b>{excluded_doj:,}</b> future hire(s) · '
-            f'Excluded <b>{excluded_sep:,}</b> separated (filter on) · '
             f'Output <b style="color:var(--brand-light)">{total_out:,}</b> row(s)</div>',
             unsafe_allow_html=True
         )
