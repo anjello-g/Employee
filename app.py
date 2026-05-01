@@ -919,32 +919,63 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
     engine = get_engine()
     if engine is None:
         return 0, 0, 'Database not connected'
+    
     try:
         total = len(df)
-        existing_df = get_all_employees_df()
-        existing_map = {}
-        if not existing_df.empty and 'ECN' in existing_df.columns:
-            existing_map = {r['ECN']: r.to_dict() for _, r in existing_df.iterrows()}
+        df['ECN'] = df['ECN'].astype(str).str.strip()
+        ecns_to_check = df['ECN'].unique().tolist()
+        
+        if not ecns_to_check:
+            return 0, 0, None
 
+        # --- OPTIMIZATION 1: Selective Loading ---
+        # Instead of loading ALL employees, we only load the ones in this file
+        existing_map = {}
+        batch_query_size = 1000
+        for i in range(0, len(ecns_to_check), batch_query_size):
+            batch_ecns = ecns_to_check[i:i + batch_query_size]
+            ph = ','.join([f':e{j}' for j in range(len(batch_ecns))])
+            params = {f'e{j}': e for j, e in enumerate(batch_ecns)}
+            
+            with engine.connect() as conn:
+                res = conn.execute(text(f"SELECT ecn, data, last_upload FROM employees WHERE ecn IN ({ph})"), params).fetchall()
+                for r in res:
+                    # Pre-parse JSON once
+                    data = json.loads(r[1]) if isinstance(r[1], str) else (r[1] or {})
+                    data['_last_upload'] = r[2]
+                    existing_map[r[0]] = data
+
+        # --- OPTIMIZATION 2: Selective Manual Edits ---
         manual_edits = {}
-        with engine.connect() as conn:
-            rows = conn.execute(text(
-                "SELECT ecn, field, MAX(start_date) as max_date FROM history "
-                "WHERE source='manual_edit' GROUP BY ecn, field"
-            )).fetchall()
-            manual_edits = {(r[0], r[1]): r[2] for r in rows}
+        for i in range(0, len(ecns_to_check), batch_query_size):
+            batch_ecns = ecns_to_check[i:i + batch_query_size]
+            ph = ','.join([f':e{j}' for j in range(len(batch_ecns))])
+            params = {f'e{j}': e for j, e in enumerate(batch_ecns)}
+            with engine.connect() as conn:
+                rows = conn.execute(text(
+                    f"SELECT ecn, field, MAX(start_date) FROM history WHERE source='manual_edit' AND ecn IN ({ph}) GROUP BY ecn, field"
+                ), params).fetchall()
+                for r in rows: manual_edits[(r[0], r[1])] = r[2]
 
         inserted, updated, skipped_manual = 0, 0, 0
         new_employees, updated_employees, history_records, unchanged_ecns = [], [], [], []
 
-        for idx, (_, row) in enumerate(df.iterrows()):
-            ecn = str(row.get('ECN', '')).strip()
-            if not ecn or ecn.lower() == 'nan':
-                continue
-            doc = row_to_doc(row.to_dict())
+        # --- OPTIMIZATION 3: Faster Processing Loop ---
+        # Cache accepted columns outside the loop
+        accepted_cols = set(get_all_accepted_columns())
+        
+        for idx, row_tuple in enumerate(df.iterrows()):
+            _, row = row_tuple
+            ecn = row['ECN']
+            if not ecn or ecn.lower() == 'nan': continue
+            
+            # Fast row processing
+            row_dict = row.to_dict()
+            doc = {k.replace('.', '_'): safe_str(v) for k, v in row_dict.items() if k.replace('.', '_') in accepted_cols}
             doc['ECN'] = ecn
+            
             existing = existing_map.get(ecn)
-            eff_from, eff_to = get_effective_dates(row.to_dict(), upload_date)
+            eff_from, eff_to = get_effective_dates(row_dict, upload_date)
 
             if existing is None:
                 doc['_created_at'] = doc['_updated_at'] = doc['_last_upload'] = upload_date
@@ -955,36 +986,34 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
                 inserted += 1
                 emp_name = doc.get('Employee', '')
                 for field, val in doc.items():
-                    if field.startswith('_') or field in ('Effective From', 'Effective To') or val == '':
-                        continue
+                    if field.startswith('_') or field in ('Effective From', 'Effective To') or val == '': continue
                     history_records.append({
-                        'ecn': ecn, 'employee_name': emp_name, 'field': field,
-                        'value': val, 'prev_value': '',
-                        'start_date': eff_from, 'end_date': eff_to, 'source': 'excel_upload'
+                        'ecn': ecn, 'employee_name': emp_name, 'field': field, 'value': val, 
+                        'prev_value': '', 'start_date': eff_from, 'end_date': eff_to, 'source': 'excel_upload'
                     })
             else:
                 changed = False
                 last_upload = existing.get('_last_upload', '2000-01-01')
                 emp_name = doc.get('Employee', existing.get('Employee', ''))
                 for field, new_val in doc.items():
-                    if field.startswith('_') or field in ('Effective From', 'Effective To'):
-                        continue
+                    if field.startswith('_') or field in ('Effective From', 'Effective To'): continue
                     old_val = existing.get(field, '')
                     if new_val != old_val:
                         if manual_edits.get((ecn, field), '') > last_upload:
                             skipped_manual += 1
                             continue
                         history_records.append({
-                            'ecn': ecn, 'employee_name': emp_name, 'field': field,
-                            'value': new_val, 'prev_value': old_val,
-                            'start_date': eff_from, 'end_date': eff_to,
-                            'source': 'excel_upload',
-                            '_close_prev': True, '_ecn': ecn, '_field': field
+                            'ecn': ecn, 'employee_name': emp_name, 'field': field, 'value': new_val, 
+                            'prev_value': old_val, 'start_date': eff_from, 'end_date': eff_to, 
+                            'source': 'excel_upload', '_close_prev': True, '_ecn': ecn, '_field': field
                         })
                         existing[field] = new_val
                         changed = True
+                
                 if changed:
                     existing['_updated_at'] = existing['_last_upload'] = upload_date
+                    # Remove internal helper key before saving
+                    existing.pop('_last_upload', None) 
                     updated_employees.append({
                         'ecn': ecn, 'data': json.dumps(existing),
                         'updated_at': upload_date, 'last_upload': upload_date
@@ -993,69 +1022,63 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
                 else:
                     unchanged_ecns.append(ecn)
 
-            if progress_bar and idx % 100 == 0:
-                progress_bar.progress(min(0.9, (idx + 1) / total), text=f'Staging {idx+1:,}/{total:,}…')
+            if progress_bar and idx % 200 == 0:
+                progress_bar.progress(min(0.9, (idx + 1) / total), text=f'Processing {idx+1:,}/{total:,}…')
 
-        if progress_bar:
-            progress_bar.progress(0.92, text='Writing to database…')
+        # --- OPTIMIZATION 4: High-Speed Batch Writes ---
+        with engine.begin() as conn: # Use engine.begin() for a single transaction
+            # Upsert New/Existing (using INSERT IGNORE or ON DUPLICATE KEY)
+            if new_employees:
+                for i in range(0, len(new_employees), BATCH_SIZE):
+                    conn.execute(text(
+                        'INSERT INTO employees (ecn, data, created_at, updated_at, last_upload) '
+                        'VALUES (:ecn, :data, :created_at, :updated_at, :last_upload) '
+                        'ON DUPLICATE KEY UPDATE data=VALUES(data), updated_at=VALUES(updated_at), last_upload=VALUES(last_upload)'
+                    ), new_employees[i:i+BATCH_SIZE])
 
-        with engine.connect() as conn:
-            # New employees
-            for i in range(0, len(new_employees), BATCH_SIZE):
-                conn.execute(text(
-                    'INSERT INTO employees (ecn, data, created_at, updated_at, last_upload) '
-                    'VALUES (:ecn, :data, :created_at, :updated_at, :last_upload) '
-                    'ON DUPLICATE KEY UPDATE data=VALUES(data), updated_at=VALUES(updated_at), last_upload=VALUES(last_upload)'
-                ), new_employees[i:i+BATCH_SIZE])
+            # History updates (Closing previous and inserting new)
+            if history_records:
+                # Optimized Close logic: Group updates by upload date
+                close_targets = [h for h in history_records if h.get('_close_prev')]
+                for h in close_targets:
+                    conn.execute(text(
+                        "UPDATE history SET end_date=:upload WHERE ecn=:ecn AND field=:field AND end_date='9999-12-31' AND start_date<:start"
+                    ), {'upload': upload_date, 'ecn': h['_ecn'], 'field': h['_field'], 'start': h['start_date']})
 
-            # Close previous history
-            close_map = defaultdict(list)
-            for h in history_records:
-                if h.get('_close_prev'):
-                    close_map[(h['_ecn'], h['_field'])].append(h['start_date'])
-            for (ecn, field), starts in close_map.items():
-                conn.execute(text(
-                    "UPDATE history SET end_date=:upload "
-                    "WHERE ecn=:ecn AND field=:field AND end_date='9999-12-31' AND start_date<:min_start"
-                ), {'upload': upload_date, 'ecn': ecn, 'field': field, 'min_start': min(starts)})
+                hist_clean = [{k: v for k, v in h.items() if not k.startswith('_')} for h in history_records]
+                for i in range(0, len(hist_clean), BATCH_SIZE):
+                    conn.execute(text(
+                        'INSERT INTO history (ecn, employee_name, field, value, prev_value, start_date, end_date, source) '
+                        'VALUES (:ecn, :employee_name, :field, :value, :prev_value, :start_date, :end_date, :source)'
+                    ), hist_clean[i:i+BATCH_SIZE])
 
-            # Insert history
-            hist_clean = [{k: v for k, v in h.items() if not k.startswith('_')} for h in history_records]
-            for i in range(0, len(hist_clean), BATCH_SIZE):
-                conn.execute(text(
-                    'INSERT INTO history (ecn, employee_name, field, value, prev_value, start_date, end_date, source) '
-                    'VALUES (:ecn, :employee_name, :field, :value, :prev_value, :start_date, :end_date, :source) '
-                    'ON DUPLICATE KEY UPDATE value=VALUES(value), prev_value=VALUES(prev_value), end_date=VALUES(end_date)'
-                ), hist_clean[i:i+BATCH_SIZE])
+            if updated_employees:
+                for i in range(0, len(updated_employees), BATCH_SIZE):
+                    conn.execute(text(
+                        'UPDATE employees SET data=:data, updated_at=:updated_at, last_upload=:last_upload WHERE ecn=:ecn'
+                    ), updated_employees[i:i+BATCH_SIZE])
 
-            # Updated employees
-            for i in range(0, len(updated_employees), BATCH_SIZE):
-                conn.execute(text(
-                    'UPDATE employees SET data=:data, updated_at=:updated_at, last_upload=:last_upload WHERE ecn=:ecn'
-                ), updated_employees[i:i+BATCH_SIZE])
-
-            # Unchanged — bump last_upload
-            for i in range(0, len(unchanged_ecns), BATCH_SIZE):
-                batch = unchanged_ecns[i:i+BATCH_SIZE]
-                ph = ','.join([f':e{j}' for j in range(len(batch))])
-                params = {f'e{j}': e for j, e in enumerate(batch)}
-                params['upload'] = upload_date
-                conn.execute(text(f"UPDATE employees SET last_upload=:upload WHERE ecn IN ({ph})"), params)
+            if unchanged_ecns:
+                for i in range(0, len(unchanged_ecns), BATCH_SIZE):
+                    batch = unchanged_ecns[i:i+BATCH_SIZE]
+                    ph = ','.join([f':e{j}' for j in range(len(batch))])
+                    params = {f'e{j}': e for j, e in enumerate(batch)}
+                    params['upload'] = upload_date
+                    conn.execute(text(f"UPDATE employees SET last_upload=:upload WHERE ecn IN ({ph})"), params)
 
             conn.execute(text(
                 'INSERT INTO upload_log (upload_date, rows_processed, inserted, updated, skipped_manual) '
                 'VALUES (:d, :r, :i, :u, :s)'
             ), {'d': upload_date, 'r': total, 'i': inserted, 'u': updated, 's': skipped_manual})
-            conn.commit()
 
-        if progress_bar:
-            progress_bar.progress(1.0, text='Done!')
+        if progress_bar: progress_bar.progress(1.0, text='Done!')
         st.cache_data.clear()
         return inserted, updated, None
 
     except Exception as e:
-        return 0, 0, str(e)
-
+        import traceback
+        return 0, 0, f"{str(e)}\n{traceback.format_exc()}"
+        
 @st.cache_data(ttl=60, show_spinner=False)
 def get_employees_at_date(query_date: str) -> pd.DataFrame:
     engine = get_engine()
