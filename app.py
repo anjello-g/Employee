@@ -846,22 +846,53 @@ def load_excel(uploaded_file) -> pd.DataFrame:
         st.error(f'Error reading Excel: {e}')
         return pd.DataFrame()
 
+def _format_date_for_export(val):
+    """Convert any date string to MM/DD/YYYY format for export."""
+    if not val or str(val).strip() in ('', 'nan', 'None', 'NaT', 'nat', 'null'):
+        return ''
+    s = str(val).strip()
+    # Strip time component if present
+    if ' ' in s:
+        s = s.split(' ')[0]
+    if 'T' in s:
+        s = s.split('T')[0]
+    # Try to parse and reformat to MM/DD/YYYY
+    for fmt in ('%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y', '%m-%d-%Y', '%d-%m-%Y', '%Y/%m/%d'):
+        try:
+            return datetime.strptime(s, fmt).strftime('%m/%d/%Y')
+        except ValueError:
+            continue
+    # Try Excel serial date
+    try:
+        return pd.to_datetime(float(s), unit='D', origin='1899-12-30').strftime('%m/%d/%Y')
+    except (ValueError, OverflowError):
+        pass
+    # If already MM/DD/YYYY, return as-is
+    return s
+
 def clean_export_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Clean dataframe for export: strip time from dates, replace NaN/None with blank."""
+    """Clean dataframe for export: format dates to MM/DD/YYYY, replace NaN/None with blank."""
     df = df.copy()
     # Replace all NaN/None/NaT with empty string
     df = df.replace({pd.NaT: '', np.nan: '', None: ''})
-    # Strip time from known date columns
+    # Format known date columns to MM/DD/YYYY
     date_cols = ['DOJ Knack', 'Date of Separation', 'Date Exported',
                  'Effective From', 'Effective To', 'Start', 'End',
                  'Last Updated', 'created_at', 'updated_at', 'last_upload']
     for col in date_cols:
         if col in df.columns:
-            df[col] = df[col].astype(str).replace({
-                'nan': '', 'None': '', 'NaT': '', 'nat': '', 'null': ''
-            })
-            # Strip time component (e.g. "2026-03-15 00:00:00" -> "2026-03-15")
-            df[col] = df[col].apply(lambda x: x.split(' ')[0] if ' ' in str(x) and str(x) != '' else x)
+            df[col] = df[col].apply(_format_date_for_export)
+    return df
+
+def format_df_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    """Format dataframe for on-screen preview: dates shown as MM/DD/YYYY."""
+    df = df.copy()
+    date_cols = ['DOJ Knack', 'Date of Separation', 'Date Exported',
+                 'Effective From', 'Effective To', 'Start', 'End',
+                 'Last Updated', 'created_at', 'updated_at', 'last_upload']
+    for col in date_cols:
+        if col in df.columns:
+            df[col] = df[col].apply(_format_date_for_export)
     return df
 
 def df_to_excel_bytes(df: pd.DataFrame, sheet_name='Staffing') -> bytes:
@@ -1393,7 +1424,7 @@ if page == 'upload':
 
         preview_df = apply_aging_bucket(apply_active_nulls(reorder_columns(df.copy())))
         with st.expander('Preview — first 10 rows'):
-            st.dataframe(preview_df.head(10), use_container_width=True, hide_index=True)
+            st.dataframe(format_df_for_display(preview_df.head(10)), use_container_width=True, hide_index=True)
 
         st.markdown('<div style="height:0.5rem;"></div>', unsafe_allow_html=True)
         if st.button('🚀  Sync to Database', type='primary'):
@@ -1592,7 +1623,7 @@ elif page == 'employees':
 
     # ── Display table with row selection ────────────────────────────────────
     sel = st.dataframe(
-        employees_df[display_cols],
+        format_df_for_display(employees_df[display_cols]),
         use_container_width=True,
         hide_index=True,
         on_select='rerun',
@@ -1874,7 +1905,7 @@ elif page == 'export':
             cols = ['Date Exported'] + [c for c in combined.columns if c != 'Date Exported']
             combined = combined[cols]
             status.success(f'✅ {len(combined):,} rows across {len(all_dfs)} days')
-            st.dataframe(combined.head(20), use_container_width=True, hide_index=True)
+            st.dataframe(format_df_for_display(combined.head(20)), use_container_width=True, hide_index=True)
             st.download_button(
                 f'⬇️  Download {exp_type} Export',
                 data=df_to_excel_bytes(combined, 'Staffing Export'),
@@ -2026,6 +2057,7 @@ elif page == 'history':
         st.stop()
 
     agg_df = pd.DataFrame(agg, columns=['ECN','Employee','Records','Last Updated','Fields Changed'])
+    agg_df['Last Updated'] = agg_df['Last Updated'].apply(_format_date_for_export)
     st.caption(f'{len(agg_df)} employees with history')
     sel = st.dataframe(agg_df, use_container_width=True, hide_index=True,
                        on_select='rerun', selection_mode='single-row')
@@ -2040,6 +2072,8 @@ elif page == 'history':
             hist_df = get_employee_history(ecn)
             if hist_df.empty:
                 st.info('No detailed records.'); return
+            hist_df['Start'] = hist_df['Start'].apply(_format_date_for_export)
+            hist_df['End'] = hist_df['End'].apply(_format_date_for_export)
 
             st.caption(f'{len(hist_df)} record(s) — select a row to edit or delete')
 
@@ -2068,9 +2102,9 @@ elif page == 'history':
                     with c1:
                         nv = st.text_input('Value', value=row['Value'])
                     with c2:
-                        ns = st.text_input('Start Date', value=row['Start'])
+                        ns = st.text_input('Start Date', value=_format_date_for_export(row['Start']))
                     with c3:
-                        ne = st.text_input('End Date', value=row['End'])
+                        ne = st.text_input('End Date', value=_format_date_for_export(row['End']))
 
                     st.markdown(f"Previous value: `{row['Previous'] or '(blank)'}`")
 
@@ -2160,6 +2194,7 @@ elif page == 'dbtools':
             if logs:
                 logs_df = pd.DataFrame(logs,
                     columns=['ID','Date','Rows Processed','Inserted','Updated','Skipped (Manual)'])
+                logs_df['Date'] = logs_df['Date'].apply(_format_date_for_export)
                 st.dataframe(logs_df, use_container_width=True, hide_index=True)
             else:
                 st.info('No uploads logged yet.')
