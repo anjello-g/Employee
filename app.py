@@ -1296,10 +1296,17 @@ def get_db_stats():
     if engine is None:
         return None, None, None
     try:
+        # Use current-day snapshot so stats reflect only employees valid today
+        today_str = date.today().isoformat()
+        df = get_employees_at_date(today_str)
+        if df.empty:
+            emp = 0
+            active = 0
+        else:
+            emp = df['ECN'].nunique()  # ensure no duplicate ECN
+            active = len(df[df.get('Active/Inactive', pd.Series()) == 'Active']) if 'Active/Inactive' in df.columns else 0
         with engine.connect() as conn:
-            emp    = conn.execute(text("SELECT COUNT(*) FROM employees WHERE LEFT(ecn,1)!='_'")).scalar()
-            active = conn.execute(text("SELECT COUNT(*) FROM employees WHERE LEFT(ecn,1)!='_' AND data->>'$.\"Active/Inactive\"'='Active'")).scalar()
-            hist   = conn.execute(text('SELECT COUNT(*) FROM history')).scalar()
+            hist = conn.execute(text('SELECT COUNT(*) FROM history')).scalar()
         return emp, active, hist
     except Exception:
         return None, None, None
@@ -1893,22 +1900,77 @@ elif page == 'history':
         st.error('Connect TiDB first.'); st.stop()
 
     engine = get_engine()
-    search = st.text_input('🔍 Search by ECN or name', placeholder='e.g. EMP001')
+
+    # ── Filters ──────────────────────────────────────────────────────────────
+    section_label('Filters')
+    f1, f2, f3, f4, f5 = st.columns([2, 2, 2, 2, 1])
+    with f1:
+        search = st.text_input('🔍 Search ECN / Name', placeholder='e.g. EMP001', key='hist_search')
+    with f2:
+        # Load distinct fields for filter
+        try:
+            with engine.connect() as conn:
+                field_rows = conn.execute(text(
+                    "SELECT DISTINCT field FROM history ORDER BY field LIMIT 200"
+                )).fetchall()
+            field_opts = ['All'] + [r[0] for r in field_rows if r[0]]
+        except Exception:
+            field_opts = ['All']
+        filter_field = st.selectbox('Field', field_opts, key='hist_field')
+    with f3:
+        filter_source = st.selectbox('Source', ['All', 'excel_upload', 'manual_edit'], key='hist_source')
+    with f4:
+        date_mode = st.selectbox('Date filter', ['All dates', 'Start date range'], key='hist_date_mode')
+    with f5:
+        if st.button('🔄 Reset', key='hist_reset', use_container_width=True):
+            for k in ['hist_search', 'hist_field', 'hist_source', 'hist_date_mode',
+                      'hist_date_from', 'hist_date_to']:
+                if k in st.session_state:
+                    del st.session_state[k]
+            st.rerun()
+
+    date_from, date_to = None, None
+    if date_mode == 'Start date range':
+        d1, d2 = st.columns(2)
+        with d1:
+            date_from = st.date_input('From', value=date(2024, 1, 1), key='hist_date_from')
+        with d2:
+            date_to = st.date_input('To', value=date.today(), key='hist_date_to')
+
+    # ── Build query ──────────────────────────────────────────────────────────
+    where_clauses = []
+    params = {}
+
+    if search:
+        where_clauses.append("(ecn LIKE :s OR employee_name LIKE :s)")
+        params['s'] = f'%{search}%'
+    if filter_field != 'All':
+        where_clauses.append("field = :f")
+        params['f'] = filter_field
+    if filter_source != 'All':
+        where_clauses.append("source = :src")
+        params['src'] = filter_source
+    if date_mode == 'Start date range' and date_from and date_to:
+        where_clauses.append("start_date BETWEEN :df AND :dt")
+        params['df'] = date_from.isoformat()
+        params['dt'] = date_to.isoformat()
+
+    where_sql = ('WHERE ' + ' AND '.join(where_clauses)) if where_clauses else ''
 
     try:
         with engine.connect() as conn:
             agg = conn.execute(text(
-                "SELECT ecn, MAX(employee_name) as emp, COUNT(*) as cnt, "
-                "MAX(start_date) as last_upd, "
-                "GROUP_CONCAT(DISTINCT field ORDER BY field SEPARATOR ', ') as fields "
-                "FROM history WHERE (:s='' OR ecn LIKE :s OR employee_name LIKE :s) "
-                "GROUP BY ecn ORDER BY last_upd DESC LIMIT 500"
-            ), {'s': f'%{search}%' if search else ''}).fetchall()
+                f"SELECT ecn, MAX(employee_name) as emp, COUNT(*) as cnt, "
+                f"MAX(start_date) as last_upd, "
+                f"GROUP_CONCAT(DISTINCT field ORDER BY field SEPARATOR ', ') as fields "
+                f"FROM history {where_sql} "
+                f"GROUP BY ecn ORDER BY last_upd DESC LIMIT 500"
+            ), params).fetchall()
     except Exception as e:
         st.error(f'Query error: {e}'); st.stop()
 
     if not agg:
-        st.info('No history records found.')
+        st.info('No history records match your filters.')
         st.stop()
 
     agg_df = pd.DataFrame(agg, columns=['ECN','Employee','Records','Last Updated','Fields Changed'])
