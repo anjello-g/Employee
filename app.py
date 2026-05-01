@@ -715,12 +715,15 @@ def safe_str(v):
     return str(v).strip()
 
 def parse_date(v):
-    if not v or str(v).strip() in ('', 'nan', 'None'):
+    if not v or str(v).strip() in ('', 'nan', 'None', 'NaT'):
         return None
     try:
         if isinstance(v, (datetime, pd.Timestamp)):
             return v.strftime('%Y-%m-%d')
         s = str(v).strip()
+        # Strip time component if present (e.g. "2026-03-15 00:00:00")
+        if ' ' in s:
+            s = s.split(' ')[0]
         for fmt in ('%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y', '%m-%d-%Y', '%d-%m-%Y', '%Y/%m/%d'):
             try:
                 return datetime.strptime(s, fmt).strftime('%Y-%m-%d')
@@ -1765,13 +1768,9 @@ elif page == 'export':
         if base_df.empty:
             st.warning('No employee data.'); st.stop()
 
-        # Pre-compute date columns once
-        base_df['__doj_dt'] = pd.to_datetime(
-            base_df['DOJ Knack'].apply(parse_date) if 'DOJ Knack' in base_df.columns else None,
-            errors='coerce')
-        base_df['__sep_dt'] = pd.to_datetime(
-            base_df['Date of Separation'].apply(parse_date) if 'Date of Separation' in base_df.columns else None,
-            errors='coerce')
+        # Pre-compute date columns once — use pd.to_datetime directly for robust parsing
+        base_df['__doj_dt'] = pd.to_datetime(base_df['DOJ Knack'], errors='coerce') if 'DOJ Knack' in base_df.columns else pd.Series(dtype='datetime64[ns]')
+        base_df['__sep_dt'] = pd.to_datetime(base_df['Date of Separation'], errors='coerce') if 'Date of Separation' in base_df.columns else pd.Series(dtype='datetime64[ns]')
 
         # Load ALL history once
         with engine.connect() as conn:
