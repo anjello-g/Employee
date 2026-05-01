@@ -1297,11 +1297,10 @@ def get_db_stats():
         return None, None, None
     try:
         with engine.connect() as conn:
-            # Total employees (ecn not starting with _ — excludes custom columns)
             emp = conn.execute(text("SELECT COUNT(*) FROM employees WHERE LEFT(ecn,1)!='_'")).scalar()
-            # Active employees (raw JSON field, no date filter — fast and accurate)
             active = conn.execute(text(
-                "SELECT COUNT(*) FROM employees WHERE LEFT(ecn,1)!='_' AND data->>'$.\"Active/Inactive\"'='Active'"
+                "SELECT COUNT(*) FROM employees WHERE LEFT(ecn,1)!='_' "
+                "AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.\\"Active/Inactive\\"')) = 'Active'"
             )).scalar()
             hist = conn.execute(text('SELECT COUNT(*) FROM history')).scalar()
         return emp, active, hist
@@ -1780,9 +1779,10 @@ elif page == 'export':
     )
     st.markdown('<div style="height:0.5rem;"></div>', unsafe_allow_html=True)
 
-    ec1, ec2 = st.columns(2)
+    ec1, ec2, ec3 = st.columns(3)
     export_mode   = ec1.radio('Sheet mode', ['Single sheet', 'One sheet per day'])
     filter_active = ec2.checkbox('Active employees only', value=False)
+    exclude_sep   = ec3.checkbox('Exclude separated employees', value=False)
     filter_cl3    = st.text_input('Filter by Client (optional)', key='exp_cl')
 
     if st.button('📥  Generate Export', type='primary'):
@@ -1796,7 +1796,7 @@ elif page == 'export':
         if base_df.empty:
             st.warning('No employee data.'); st.stop()
 
-        # Pre-compute date columns once — use pd.to_datetime directly for robust parsing
+        # Pre-compute date columns — pd.to_datetime handles almost any format natively
         base_df['__doj_dt'] = pd.to_datetime(base_df['DOJ Knack'], errors='coerce') if 'DOJ Knack' in base_df.columns else pd.Series(dtype='datetime64[ns]')
         base_df['__sep_dt'] = pd.to_datetime(base_df['Date of Separation'], errors='coerce') if 'Date of Separation' in base_df.columns else pd.Series(dtype='datetime64[ns]')
 
@@ -1821,10 +1821,21 @@ elif page == 'export':
         all_dfs    = []
         ts_list    = [pd.Timestamp(datetime.strptime(d, '%Y-%m-%d').date()) for d in dates]
 
+        total_loaded = len(base_clean)
+        excluded_doj = 0
+        excluded_sep = 0
+
         for i, (d_str, d_ts) in enumerate(zip(dates, ts_list)):
             mask = pd.Series(True, index=base_clean.index)
-            mask &= base_clean['__doj_dt'].isna() | (base_clean['__doj_dt'] <= d_ts)
-            mask &= base_clean['__sep_dt'].isna() | (base_clean['__sep_dt'] >= d_ts)
+            # Exclude future hires (not yet employed on this date)
+            doj_mask = base_clean['__doj_dt'].isna() | (base_clean['__doj_dt'] <= d_ts)
+            excluded_doj += (~doj_mask).sum()
+            mask &= doj_mask
+            # Optionally exclude already-separated employees
+            if exclude_sep:
+                sep_mask = base_clean['__sep_dt'].isna() | (base_clean['__sep_dt'] >= d_ts)
+                excluded_sep += (~sep_mask).sum()
+                mask &= sep_mask
             df_day = base_clean[mask].copy()
             if df_day.empty:
                 continue
@@ -1855,6 +1866,18 @@ elif page == 'export':
 
         if not all_dfs:
             st.warning('No data for the selected range.'); st.stop()
+
+        # Show breakdown metrics
+        total_out = sum(len(d) for d in all_dfs)
+        st.markdown(
+            f'<div style="background:var(--bg-card);border:1px solid var(--border);'
+            f'border-radius:6px;padding:0.6rem 1rem;font-size:0.85rem;color:var(--text-muted);margin-bottom:0.75rem;">'
+            f'Loaded <b>{total_loaded:,}</b> from DB · '
+            f'Excluded <b>{excluded_doj:,}</b> future hire(s) · '
+            f'Excluded <b>{excluded_sep:,}</b> separated (filter on) · '
+            f'Output <b style="color:var(--brand-light)">{total_out:,}</b> row(s)</div>',
+            unsafe_allow_html=True
+        )
 
         if export_mode == 'Single sheet':
             combined = pd.concat(all_dfs, ignore_index=True)
