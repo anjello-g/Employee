@@ -1601,7 +1601,7 @@ elif page == 'employees':
         st.stop()
 
     employees_df = reorder_columns(employees_df)
-    display_cols = [c for c in DISPLAY_ORDER if c in employees_df.columns][:10]
+    display_cols = [c for c in DISPLAY_ORDER if c in employees_df.columns and c != 'Date Exported'][:10]
 
     # ── Selection mode ──────────────────────────────────────────────────────
     section_label('Selection')
@@ -1659,7 +1659,7 @@ elif page == 'employees':
 
             if st.toggle('Show all fields', key=f'sem_{ecn}'):
                 others = [k for k in emp if not k.startswith('_') and k not in core
-                          and k not in ('ECN', 'Effective From', 'Effective To')]
+                          and k not in ('ECN', 'Date Exported', 'Effective From', 'Effective To')]
                 cols2 = st.columns(3)
                 for i, f in enumerate(others):
                     with cols2[i % 3]:
@@ -1718,7 +1718,7 @@ elif page == 'employees':
                 if st.toggle('Show more fields', key='besm'):
                     others = [k for k in employees_df.columns
                               if not k.startswith('_') and k not in common
-                              and k not in ('ECN', 'Select', 'Effective From', 'Effective To')]
+                              and k not in ('ECN', 'Date Exported', 'Select', 'Effective From', 'Effective To')]
                     cols2 = st.columns(3)
                     for i, f in enumerate(others):
                         fvals = [e.get(f, '') for e in emps]
