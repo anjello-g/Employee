@@ -20,7 +20,7 @@ try:
 except ImportError:
     TIDB_AVAILABLE = False
 
-st.set_page_config(page_title='Staffing Dashboard', page_icon='👥', layout='wide', initial_sidebar_state='expanded')
+st.set_page_config(page_title='Knack RCM | Employee Dashboard', page_icon='https://kimi-web-img.moonshot.cn/img/knackrcm.com/26ef9a05ac06e2c7d058a5cafefa681569032b17.png', layout='wide', initial_sidebar_state='expanded')
 
 def parse_and_escape_uri(uri: str) -> str:
     if not uri or not uri.startswith('mysql'):
@@ -154,11 +154,12 @@ DROPPED_COLS = {
     'Source.Name', 'Sr No', 'Date', 'Column98', 'Start of the Month',
     'End of the Month', 'Start of Week', 'Lookup', 'Shift Timing',
     'Allocated Seats', 'Seat Number', 'Client Approved Billable',
-    'Tagging', 'Role Tagging', 'Specialty'
+    'Tagging', 'Role Tagging', 'Specialty',
+    'Source_Name', 'Expected Move Date', 'Driver'
 }
 
 DISPLAY_ORDER = [
-    'Date Exported', 'ECN', 'Employee', 'Client', 'Sub-Process', 'Supervisor',
+    'ECN', 'Employee', 'Client', 'Sub-Process', 'Supervisor',
     'Manager', 'Role', 'Process Owner', 'Billable/Buffer', 'DOJ Knack',
     'Date of Separation', 'Active/Inactive', 'Email', 'NT Login', 'Structure',
     'Department', 'Aging Bucket', 'Location', 'Gender', 'Global ID (GPP)',
@@ -212,6 +213,11 @@ def apply_active_nulls(df: pd.DataFrame, query_date: str = None) -> pd.DataFrame
             df.loc[mask, 'Reason for Attrition'] = ''
     return df
 BATCH_SIZE = 1000
+
+def hide_date_exported(df: pd.DataFrame) -> pd.DataFrame:
+    if 'Date Exported' in df.columns:
+        df = df.drop(columns=['Date Exported'], errors='ignore')
+    return df
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_all_employees_df() -> pd.DataFrame:
@@ -435,8 +441,23 @@ def get_db_stats():
     return emp_count, active_count, hist_count
 
 with st.sidebar:
-    st.image('https://img.icons8.com/color/96/group.png', width=60)
-    st.title('Staffing App')
+    st.image('https://kimi-web-img.moonshot.cn/img/knackrcm.com/26ef9a05ac06e2c7d058a5cafefa681569032b17.png', width=80)
+    st.title('Knack RCM')
+    st.markdown('''
+    <style>
+    .stApp { background-color: #f8fafc; }
+    .stSidebar { background-color: #1a3a5c !important; }
+    .stSidebar .stMarkdown { color: white !important; }
+    .stSidebar [data-testid='stRadio'] label { color: white !important; font-weight: 500; }
+    .stSidebar [data-testid='stRadio'] label:hover { color: #5ba8d8 !important; }
+    .stButton>button { background-color: #2d6da8; color: white; border-radius: 6px; border: none; }
+    .stButton>button:hover { background-color: #1a3a5c; color: white; }
+    .stButton>button[kind='primary'] { background-color: #2d6da8; }
+    h1, h2, h3 { color: #1a3a5c !important; font-family: 'Segoe UI', sans-serif; }
+    .stDataFrame { border: 1px solid #e2e8f0; border-radius: 8px; }
+    .stMetric { background: white; padding: 16px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    </style>
+    ''', unsafe_allow_html=True)
     st.divider()
     if db_connected():
         st.success('✅ TiDB Connected')
@@ -449,10 +470,10 @@ with st.sidebar:
         st.toast('Cache cleared!', icon='✅')
         st.rerun()
     st.divider()
-    page = st.radio('Navigation', ['📤 Upload / Sync', '👤 Employee Editor', '📅 Date Snapshot', '📊 Export Data', '📜 History Manager', '🛠️ DB Tools'])
+    page = st.radio('Menu', ['📤 Upload & Sync', '👤 Employees', '📅 Snapshot', '📊 Export', '📜 History', '🛠️ DB Tools'])
 
-if page == '📤 Upload / Sync':
-    st.title('📤 Upload & Sync Staffing Data')
+if page == '📤 Upload & Sync':
+    st.title('📤 Data Upload & Sync')
     if not db_connected(): st.error('Please configure a valid TiDB URI in Streamlit Secrets first.'); st.stop()
     st.subheader('📋 Template')
     st.download_button(label='⬇️ Download Excel Template', data=generate_template_bytes(), file_name='staffing_template.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
@@ -476,10 +497,29 @@ if page == '📤 Upload / Sync':
         existing_cols = set(get_all_employees_df().columns) if db_connected() else set()
         new_cols = [c for c in df.columns if c not in existing_cols and c not in DROPPED_COLS and not c.startswith('_')]
         if new_cols:
-            st.info(f'📎 New columns detected: {', '.join(new_cols)}')
-            if st.button('➕ Add These Columns to Database', key='add_new_cols'):
-                st.cache_data.clear()
-                st.success('Columns added!'); st.rerun()
+            st.warning(f'⚠️ Unapproved columns detected: {', '.join(new_cols)}')
+            st.markdown('**These columns are NOT in the database yet.** Approve them to include in future uploads.')
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button('✅ Approve & Add Columns', key='approve_cols', type='primary'):
+                    engine = get_engine()
+                    if engine:
+                        try:
+                            with engine.connect() as conn:
+                                for col in new_cols:
+                                    conn.execute(text('INSERT IGNORE INTO employees (ecn, data, created_at, updated_at, last_upload) VALUES (:ecn, :data, :d, :d, :d)'), {'ecn': '_COL_' + col, 'data': json.dumps({'col_name': col, 'approved': True}), 'd': '2000-01-01'})
+                                conn.commit()
+                            st.cache_data.clear()
+                            st.success(f'✅ {len(new_cols)} column(s) approved and added!')
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f'Error saving columns: {e}')
+            with c2:
+                if st.button('❌ Ignore (Skip These Columns)', key='ignore_cols'):
+                    st.session_state['_ignored_cols'] = st.session_state.get('_ignored_cols', []) + new_cols
+                    st.info('Columns ignored for this session.')
+                    st.rerun()
+            st.divider()
         if st.button('🚀 Sync to Database', type='primary'):
             # Save any pending new columns
             pending = st.session_state.pop('_pending_new_cols', None)
@@ -504,8 +544,8 @@ if page == '📤 Upload / Sync':
         c1, c2, c3 = st.columns(3)
         c1.metric('Total Employees', f'{emp_count:,}'); c2.metric('Active', f'{active_count:,}'); c3.metric('History Records', f'{hist_count:,}')
 
-elif page == '👤 Employee Editor':
-    st.title('👤 Employee Editor')
+elif page == '👤 Employees':
+    st.title('👤 Employee Management')
     engine = get_engine()
     if engine is None: st.error('Connect TiDB first.'); st.stop()
     st.info('**How it works:** Select multiple employees with checkboxes, then click **Bulk Edit** to edit them all at once. Or click any single row to edit individually. Fields that share the same value across selected employees are pre-filled.')
@@ -567,6 +607,7 @@ elif page == '👤 Employee Editor':
     employees_df = drop_unwanted_columns(employees_df)
     employees_df = apply_aging_bucket(employees_df)
     employees_df = reorder_columns(employees_df)
+    employees_df = hide_date_exported(employees_df)
     display_cols = [c for c in DISPLAY_ORDER if c in employees_df.columns][:10]
     display_cols = [c for c in display_cols if c in employees_df.columns]
     st.markdown(f'**{len(employees_df)} employees found**')
@@ -667,8 +708,8 @@ elif page == '👤 Employee Editor':
                 with c2:
                     if st.button('❌ Cancel', key='be_cancel'): st.session_state['show_bulk_edit'] = False; st.rerun()
             bulk_edit_modal()
-elif page == '📅 Date Snapshot':
-    st.title('📅 Date Snapshot')
+elif page == '📅 Snapshot':
+    st.title('📅 Historical Snapshot')
     st.markdown('View staffing data **as it was on any specific date**.')
     if not db_connected(): st.error('Connect TiDB first.'); st.stop()
     snap_date = st.date_input('Select snapshot date', value=date.today())
@@ -679,6 +720,7 @@ elif page == '📅 Date Snapshot':
     with c3: filter_status = st.selectbox('Status', ['All', 'Active', 'Inactive', 'LOA', 'Maternity', 'Suspended'])
     if st.button('📸 Load Snapshot', type='primary'):
         with st.spinner(f'Building snapshot for {snap_str}...'): df = get_employees_at_date(snap_str)
+        df = hide_date_exported(df)
         if df.empty: st.warning('No data found.')
         else:
             if filter_client and 'Client' in df.columns: df = df[df['Client'].str.contains(filter_client, case=False, na=False)]
@@ -695,8 +737,8 @@ elif page == '📅 Date Snapshot':
             st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
             st.download_button(label=f'⬇️ Download Snapshot ({snap_str})', data=df_to_excel_bytes(df, sheet_name=f'Snapshot_{snap_str}'), file_name=f'staffing_snapshot_{snap_str}.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
-elif page == '📊 Export Data':
-    st.title('📊 Export Data')
+elif page == '📊 Export':
+    st.title('📊 Data Export')
     st.markdown('Export staffing data for any time range. **Ultra-fast** — pre-computes everything in-memory.')
     if not db_connected(): st.error('Connect TiDB first.'); st.stop()
     exp_type = st.radio('Export Type', ['Daily', 'Weekly', 'Monthly', 'Yearly', 'Custom Range'], horizontal=True)
@@ -802,8 +844,8 @@ elif page == '📊 Export Data':
             status.success(f'✅ {len(all_dfs)} daily sheets generated!')
             st.download_button('⬇️ Download Daily Export', data=buf.getvalue(), file_name=f'staffing_{label}_daily.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
-elif page == '📜 History Manager':
-    st.title('📜 History Manager')
+elif page == '📜 History':
+    st.title('📜 Change History')
     st.markdown('One row per employee. Click to view, edit, or delete their history records in a modal.')
     if not db_connected(): st.error('Connect TiDB first.'); st.stop()
     engine = get_engine()
@@ -819,6 +861,7 @@ elif page == '📜 History Manager':
         @st.dialog(f'📋 History for {emp_name or ecn}', width='large')
         def history_modal():
             hist_df = get_employee_history(ecn)
+            hist_df = hide_date_exported(hist_df)
             if hist_df.empty: st.info('No detailed history found.'); return
             for _, row in hist_df.iterrows():
                 with st.container(border=True):
@@ -866,7 +909,7 @@ elif page == '📜 History Manager':
         with st.spinner('Cleaning...'): deleted = compact_history()
         st.success(f'Removed **{deleted}** redundant records')
 elif page == '🛠️ DB Tools':
-    st.title('🛠️ Database Tools')
+    st.title('🛠️ Database Maintenance')
     if not db_connected(): st.error('Connect TiDB first.'); st.stop()
     c1, c2 = st.columns(2)
     with c1:
