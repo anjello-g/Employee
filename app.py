@@ -47,7 +47,7 @@ def get_db():
         return None, None
     uri = parse_and_escape_uri(uri)
     try:
-        engine = create_engine(uri, connect_args={'ssl': {'ca': certifi.where()}, 'connect_timeout': 10}, pool_pre_ping=True, pool_recycle=3600, pool_size=5, max_overflow=10)
+        engine = create_engine(uri, connect_args={'ssl': {'ca': certifi.where()}, 'connect_timeout': 10}, pool_pre_ping=True, pool_recycle=3600, pool_size=10, max_overflow=20, pool_timeout=30)
         with engine.connect() as conn:
             conn.execute(text('SELECT 1'))
         metadata = MetaData()
@@ -133,25 +133,89 @@ def generate_template_bytes() -> bytes:
         'Effective From': ['', ''], 'Effective To': ['', ''],
         'Client': ['ABC Corp', 'XYZ Inc'], 'Sub-Process': ['Support', 'Billing'],
         'Supervisor': ['Manager A', 'Manager B'], 'Role': ['Agent', 'Senior Agent'],
-        'Manager': ['Director X', 'Director Y'], 'DOJ Project': ['2024-01-15', '2024-03-01'],
-        'Shift Timing': ['9AM-6PM', '10AM-7PM'], 'Email': ['john@company.com', 'jane@company.com'],
-        'NT Login': ['jdoe', 'jsmith'], 'Structure': ['Ops', 'Ops'],
-        'Billable/Buffer': ['Billable', 'Buffer'], 'Process Owner': ['Owner 1', 'Owner 2'],
+        'Manager': ['Director X', 'Director Y'],
+        'Process Owner': ['Owner 1', 'Owner 2'],
         'Department': ['Customer Service', 'Finance'], 'Location': ['Manila', 'Cebu'],
-        'Allocated Seats': ['A1', 'B2'], 'Gender': ['Male', 'Female'],
-        'Seat Number': ['101', '102'], 'Global ID (GPP)': ['GPP001', 'GPP002'],
+        'Gender': ['Male', 'Female'],
+        'Global ID (GPP)': ['GPP001', 'GPP002'],
         'Active/Inactive': ['Active', 'Active'], 'CDP Email': ['john.cdp@company.com', 'jane.cdp@company.com'],
-        'BufferAgent': ['', ''], 'EWS Type': ['', ''], 'Driver': ['', ''],
+        'EWS Type': ['', ''], 'Driver': ['', ''],
         'Expected Move Date': ['', ''], 'Overall Location': ['PH', 'PH'],
-        'Client Approved Billable': ['Yes', 'No'], 'Tagging': ['', ''],
-        'Role Tagging': ['', ''], 'Specialty': ['', ''],
+        'Attrition Type': ['', ''], 'Reason for Attrition': ['', ''],
+        'Email': ['john@company.com', 'jane@company.com'],
+        'NT Login': ['jdoe', 'jsmith'], 'Structure': ['Ops', 'Ops'],
+        'Billable/Buffer': ['Billable', 'Buffer'],
     }
     return df_to_excel_bytes(pd.DataFrame(template_data), sheet_name='Consolidated Staffing')
 
+# ─── COLUMN MANAGEMENT ──────────────────────────────────────────────────────
+DROPPED_COLS = {
+    'DOJ Project', 'Aging Knack', 'Aging Project', 'BufferAgent', 'Column80',
+    'Source.Name', 'Sr No', 'Date', 'Column98', 'Start of the Month',
+    'End of the Month', 'Start of Week', 'Lookup', 'Shift Timing',
+    'Allocated Seats', 'Seat Number', 'Client Approved Billable',
+    'Tagging', 'Role Tagging', 'Specialty'
+}
+
+DISPLAY_ORDER = [
+    'Date Exported', 'ECN', 'Employee', 'Client', 'Sub-Process', 'Supervisor',
+    'Manager', 'Role', 'Process Owner', 'Billable/Buffer', 'DOJ Knack',
+    'Date of Separation', 'Active/Inactive', 'Email', 'NT Login', 'Structure',
+    'Department', 'Aging Bucket', 'Location', 'Gender', 'Global ID (GPP)',
+    'Attrition Type', 'Reason for Attrition', 'CDP Email', 'EWS Type',
+    'Driver', 'Expected Move Date', 'Overall Location'
+]
+
+def drop_unwanted_columns(df: pd.DataFrame) -> pd.DataFrame:
+    cols_to_drop = [c for c in DROPPED_COLS if c in df.columns]
+    if cols_to_drop:
+        df = df.drop(columns=cols_to_drop, errors='ignore')
+    return df
+
+def reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
+    ordered = [c for c in DISPLAY_ORDER if c in df.columns]
+    remaining = [c for c in df.columns if c not in ordered]
+    return df[ordered + remaining]
+
+def calculate_aging_bucket(doj_str: str, sep_str: str, ref_date: date) -> str:
+    doj = parse_date(doj_str)
+    sep = parse_date(sep_str)
+    if not doj: return ''
+    end_dt = datetime.strptime(sep, '%Y-%m-%d').date() if sep else ref_date
+    start_dt = datetime.strptime(doj, '%Y-%m-%d').date()
+    delta = (end_dt - start_dt).days
+    if delta <= 30: return '0-30'
+    elif delta <= 60: return '31-60'
+    elif delta <= 90: return '61-90'
+    elif delta <= 180: return '91-180'
+    elif delta <= 365: return '181-1yr'
+    elif delta <= 730: return '1-2yrs'
+    else: return '2yrs+'
+
+def apply_aging_bucket(df: pd.DataFrame, ref_date: date = None) -> pd.DataFrame:
+    if ref_date is None: ref_date = date.today()
+    if 'DOJ Knack' in df.columns:
+        df['Aging Bucket'] = df.apply(
+            lambda r: calculate_aging_bucket(r.get('DOJ Knack', ''), r.get('Date of Separation', ''), ref_date),
+            axis=1
+        )
+    return df
+
+def apply_active_nulls(df: pd.DataFrame, query_date: str = None) -> pd.DataFrame:
+    if query_date and 'Active/Inactive' in df.columns:
+        mask = df['Active/Inactive'] == 'Active'
+        if 'Date of Separation' in df.columns:
+            df.loc[mask, 'Date of Separation'] = ''
+        if 'Attrition Type' in df.columns:
+            df.loc[mask, 'Attrition Type'] = ''
+        if 'Reason for Attrition' in df.columns:
+            df.loc[mask, 'Reason for Attrition'] = ''
+    return df
 BATCH_SIZE = 1000
 
-def get_all_employees_df(engine) -> pd.DataFrame:
-    if engine is None: return pd.DataFrame()
+@st.cache_data(ttl=60, show_spinner=False)
+def get_all_employees_df() -> pd.DataFrame:
+    engine = get_engine()
     query = text('SELECT ecn, data, created_at, updated_at, last_upload FROM employees')
     df = pd.read_sql(query, engine)
     if df.empty: return df
@@ -164,7 +228,11 @@ def get_all_employees_df(engine) -> pd.DataFrame:
         data['_updated_at'] = row['updated_at']
         data['_last_upload'] = row['last_upload']
         records.append(data)
-    return pd.DataFrame(records)
+    df = pd.DataFrame(records)
+    df = drop_unwanted_columns(df)
+    df = apply_aging_bucket(df)
+    df = reorder_columns(df)
+    return df
 
 def get_employee(engine, ecn: str) -> dict:
     with engine.connect() as conn:
@@ -178,7 +246,7 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
     engine = get_engine()
     if engine is None: return 0, 0, 'Database not connected'
     total_rows = len(df)
-    existing_df = get_all_employees_df(engine)
+    existing_df = get_all_employees_df()
     existing_map = {}
     if not existing_df.empty and 'ECN' in existing_df.columns:
         existing_map = {row['ECN']: row.to_dict() for _, row in existing_df.iterrows()}
@@ -245,12 +313,12 @@ def upsert_employees(df: pd.DataFrame, upload_date: str, progress_bar=None):
         conn.execute(text('INSERT INTO upload_log (upload_date, rows_processed, inserted, updated, skipped_manual) VALUES (:date, :rows, :ins, :upd, :skip)'), {'date': upload_date, 'rows': total_rows, 'ins': inserted, 'upd': updated, 'skip': skipped_manual})
         conn.commit()
     if progress_bar is not None: progress_bar.progress(1.0, text='Done!')
+    st.cache_data.clear()
     return inserted, updated, None
 
+@st.cache_data(ttl=60, show_spinner=False)
 def get_employees_at_date(query_date: str) -> pd.DataFrame:
-    engine = get_engine()
-    if engine is None: return pd.DataFrame()
-    df = get_all_employees_df(engine)
+    df = get_all_employees_df()
     if df.empty: return df
     if 'DOJ Knack' in df.columns:
         df['__doj'] = df['DOJ Knack'].apply(parse_date)
@@ -270,7 +338,12 @@ def get_employees_at_date(query_date: str) -> pd.DataFrame:
         for (ecn, field), val in overrides.items():
             if field in df.columns: df.loc[df['ECN'] == ecn, field] = val
     internal = [c for c in df.columns if c.startswith('_')]
-    return df.drop(columns=internal, errors='ignore')
+    df = drop_unwanted_columns(df)
+    df = apply_aging_bucket(df, datetime.strptime(query_date, "%Y-%m-%d").date())
+    df = apply_active_nulls(df, query_date)
+    df = reorder_columns(df)
+    internal = [c for c in df.columns if c.startswith("_")]
+    return df.drop(columns=internal, errors="ignore")
 
 def record_manual_edit(ecn: str, field: str, new_value: str, start_date: str, end_date: str = '9999-12-31'):
     engine = get_engine()
@@ -287,10 +360,12 @@ def record_manual_edit(ecn: str, field: str, new_value: str, start_date: str, en
                 existing[field] = new_value; existing['_updated_at'] = start_date
                 conn.execute(text('UPDATE employees SET data = :data, updated_at = :updated WHERE ecn = :ecn'), {'ecn': ecn, 'data': json.dumps(existing), 'updated': start_date})
             conn.commit()
+        st.cache_data.clear()
         return True, 'Saved'
     except Exception as e:
         return False, f'Error: {str(e)[:100]}'
 
+@st.cache_data(ttl=60, show_spinner=False)
 def get_employee_history(ecn: str) -> pd.DataFrame:
     engine = get_engine()
     if engine is None: return pd.DataFrame()
@@ -317,6 +392,7 @@ def delete_history_record(record_id: int):
             else:
                 if emp: emp[field] = ''; conn.execute(text('UPDATE employees SET data = :data WHERE ecn = :ecn'), {'ecn': ecn, 'data': json.dumps(emp)})
             conn.commit()
+        st.cache_data.clear()
         return True, 'Deleted and restored previous value'
     except Exception as e:
         return False, f'Error: {str(e)[:100]}'
@@ -333,6 +409,7 @@ def update_history_record(record_id: int, new_value: str, new_start: str, new_en
                 emp = get_employee(engine, record['ecn'])
                 if emp: emp[record['field']] = new_value; conn.execute(text('UPDATE employees SET data = :data WHERE ecn = :ecn'), {'ecn': record['ecn'], 'data': json.dumps(emp)})
             conn.commit()
+        st.cache_data.clear()
         return True, 'Updated'
     except Exception as e:
         return False, f'Error: {str(e)[:100]}'
@@ -343,9 +420,11 @@ def compact_history():
     try:
         with engine.connect() as conn:
             result = conn.execute(text("DELETE FROM history WHERE value = prev_value AND value != ''"))
+            st.cache_data.clear()
             conn.commit(); return result.rowcount
     except Exception: return 0
 
+@st.cache_data(ttl=60, show_spinner=False)
 def get_db_stats():
     engine = get_engine()
     if engine is None: return None, None, None
@@ -364,6 +443,11 @@ with st.sidebar:
     else:
         err = st.session_state.get('_db_err', '')
         st.error(f'❌ {err[:120]}') if err else st.warning('⚠️ No TiDB URI configured')
+    st.divider()
+    if st.button('🔄 Refresh Data', use_container_width=True):
+        st.cache_data.clear()
+        st.toast('Cache cleared!', icon='✅')
+        st.rerun()
     st.divider()
     page = st.radio('Navigation', ['📤 Upload / Sync', '👤 Employee Editor', '📅 Date Snapshot', '📊 Export Data', '📜 History Manager', '🛠️ DB Tools'])
 
@@ -388,7 +472,26 @@ if page == '📤 Upload / Sync':
         st.success(f'✅ **{len(df):,} rows**, **{len(df.columns)} columns**')
         st.caption(f'Columns: {', '.join(df.columns[:12])}{'...' if len(df.columns) > 12 else ''}')
         with st.expander('Preview (first 10 rows)'): st.dataframe(df.head(10), use_container_width=True)
+        # Detect new columns
+        existing_cols = set(get_all_employees_df().columns) if db_connected() else set()
+        new_cols = [c for c in df.columns if c not in existing_cols and c not in DROPPED_COLS and not c.startswith('_')]
+        if new_cols:
+            st.info(f'📎 New columns detected: {', '.join(new_cols)}')
+            if st.button('➕ Add These Columns to Database', key='add_new_cols'):
+                st.cache_data.clear()
+                st.success('Columns added!'); st.rerun()
         if st.button('🚀 Sync to Database', type='primary'):
+            # Save any pending new columns
+            pending = st.session_state.pop('_pending_new_cols', None)
+            if pending:
+                engine = get_engine()
+                if engine:
+                    try:
+                        with engine.connect() as conn:
+                            for col in pending:
+                                conn.execute(text('INSERT IGNORE INTO employees (ecn, data, created_at, updated_at, last_upload) VALUES (:ecn, :data, :d, :d, :d)'), {'ecn': '_COL_' + col, 'data': json.dumps({'col_name': col}), 'd': '2000-01-01'})
+                            conn.commit()
+                    except Exception as e: st.warning(f'Could not save column metadata: {e}')
             today_str = date.today().isoformat(); progress = st.progress(0, text='Preparing...')
             with st.spinner('Writing to TiDB...'): inserted, updated, err = upsert_employees(df, today_str, progress_bar=progress)
             if err: st.error(err)
@@ -407,7 +510,7 @@ elif page == '👤 Employee Editor':
     if engine is None: st.error('Connect TiDB first.'); st.stop()
     st.info('**How it works:** Select multiple employees with checkboxes, then click **Bulk Edit** to edit them all at once. Or click any single row to edit individually. Fields that share the same value across selected employees are pre-filled.')
 
-    employees_df = get_all_employees_df(engine)
+    employees_df = get_all_employees_df()
     if employees_df.empty: st.warning('No employees found.'); st.stop()
 
     # ─── FILTERS ─────────────────────────────────────────────────────────────
@@ -461,7 +564,10 @@ elif page == '👤 Employee Editor':
 
     if employees_df.empty: st.warning('No employees match your filters.'); st.stop()
 
-    display_cols = ['ECN', 'Employee', 'Client', 'Sub-Process', 'Role', 'Billable/Buffer', 'Active/Inactive', 'Location', 'Overall Location']
+    employees_df = drop_unwanted_columns(employees_df)
+    employees_df = apply_aging_bucket(employees_df)
+    employees_df = reorder_columns(employees_df)
+    display_cols = [c for c in DISPLAY_ORDER if c in employees_df.columns][:10]
     display_cols = [c for c in display_cols if c in employees_df.columns]
     st.markdown(f'**{len(employees_df)} employees found**')
 
@@ -585,7 +691,7 @@ elif page == '📅 Date Snapshot':
                 m2.metric('Buffer', len(df[df['Billable/Buffer'] == 'Buffer']))
                 m3.metric('Support', len(df[df['Billable/Buffer'] == 'Support']))
             if 'Active/Inactive' in df.columns: m4.metric('Active', len(df[df['Active/Inactive'] == 'Active']))
-            display_cols = [c for c in ['ECN', 'Employee', 'Client', 'Sub-Process', 'Role', 'Billable/Buffer', 'Active/Inactive', 'Location', 'Overall Location', 'Supervisor', 'Manager'] if c in df.columns]
+            display_cols = [c for c in DISPLAY_ORDER if c in df.columns]
             st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
             st.download_button(label=f'⬇️ Download Snapshot ({snap_str})', data=df_to_excel_bytes(df, sheet_name=f'Snapshot_{snap_str}'), file_name=f'staffing_snapshot_{snap_str}.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
@@ -629,7 +735,7 @@ elif page == '📊 Export Data':
     if st.button('📥 Generate Export', type='primary'):
         status = st.empty(); status.info('⏳ Loading base data from TiDB (one time)...')
         engine = get_engine()
-        base_df = get_all_employees_df(engine)
+        base_df = get_all_employees_df()
         if base_df.empty: st.warning('No employee data found.'); st.stop()
         # Pre-compute DOJ/Sep as datetime once
         if 'DOJ Knack' in base_df.columns: base_df['__doj_dt'] = pd.to_datetime(base_df['DOJ Knack'].apply(parse_date), errors='coerce')
@@ -669,6 +775,10 @@ elif page == '📊 Export Data':
             df_day = df_day.drop(columns=[c for c in df_day.columns if c.startswith('__')], errors='ignore')
             if filter_active and 'Active/Inactive' in df_day.columns: df_day = df_day[df_day['Active/Inactive'] == 'Active']
             if filter_client2 and 'Client' in df_day.columns: df_day = df_day[df_day['Client'].str.contains(filter_client2, case=False, na=False)]
+            df_day = drop_unwanted_columns(df_day)
+            df_day = apply_aging_bucket(df_day, datetime.strptime(d_str, "%Y-%m-%d").date())
+            df_day = apply_active_nulls(df_day, d_str)
+            df_day = reorder_columns(df_day)
             if not df_day.empty: df_day['Date Exported'] = d_str; all_dfs.append(df_day)
             if i % 50 == 0 or i == len(dates) - 1: status.info(f'⏳ Processed {i + 1}/{len(dates)} days...')
         if not all_dfs: st.warning('No data found for the selected range.'); st.stop()
